@@ -169,6 +169,13 @@ impl ApplicationHandle {
         f(cx)
     }
 
+    /// Like [`update`](Self::update), but gives `None` instead of panicking when the app is
+    /// already being updated further up the stack (an embedder called back re-entrantly).
+    pub fn try_update<R>(&self, f: impl FnOnce(&mut App) -> R) -> Option<R> {
+        let mut cx = self.app.try_borrow_mut().ok()?;
+        Some(f(&mut cx))
+    }
+
     /// An [`AsyncApp`] for use across await points. It holds the app weakly; keeping the
     /// app alive remains this handle's job.
     pub fn to_async(&self) -> AsyncApp {

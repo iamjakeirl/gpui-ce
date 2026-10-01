@@ -109,6 +109,9 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) is_child: bool,
     /// The platform is embedded: no GPUI message loop translates keys for this window.
     pub(crate) embedded: bool,
+    /// Windows has destroyed `hwnd` (`WM_DESTROY` arrived), perhaps with its parent: queued
+    /// work must not use the handle, which Windows may give to another window.
+    pub(crate) destroyed: Cell<bool>,
 }
 
 impl WindowsWindowState {
@@ -284,6 +287,7 @@ impl WindowsWindowInner {
             parent_hwnd: context.parent_hwnd,
             is_child: context.is_child,
             embedded: context.embedded,
+            destroyed: Cell::new(false),
         }))
     }
 
@@ -634,10 +638,10 @@ impl Drop for WindowsWindow {
         self.0
             .executor
             .spawn(async move {
-                let handle = this.hwnd;
-                unsafe {
-                    RevokeDragDrop(handle).log_err();
-                    DestroyWindow(handle).log_err();
+                // `WM_DESTROY` revokes drag and drop; a window already destroyed (with its
+                // parent, say) is left alone.
+                if !this.destroyed.get() {
+                    unsafe { DestroyWindow(this.hwnd).log_err() };
                 }
             })
             .detach();
@@ -674,10 +678,14 @@ impl PlatformWindow for WindowsWindow {
         } else {
             SWP_NOMOVE
         };
+        let this = self.0.clone();
 
         self.0
             .executor
             .spawn(async move {
+                if this.destroyed.get() {
+                    return;
+                }
                 unsafe {
                     SetWindowPos(
                         hwnd,
@@ -827,10 +835,13 @@ impl PlatformWindow for WindowsWindow {
         let hwnd = self.0.hwnd;
         if self.0.is_child {
             // Never bring the host forward or fake input: take the keyboard focus only.
+            let this = self.0.clone();
             self.0
                 .executor
                 .spawn(async move {
-                    unsafe { SetFocus(Some(hwnd)).ok() };
+                    if !this.destroyed.get() {
+                        unsafe { SetFocus(Some(hwnd)).ok() };
+                    }
                 })
                 .detach();
             return true;
@@ -1221,10 +1232,16 @@ struct WindowsDragDropHandler(pub Rc<WindowsWindowInner>);
 
 impl WindowsDragDropHandler {
     fn handle_drag_drop(&self, input: PlatformInput) {
-        if let Some(mut func) = self.0.state.callbacks.input.take() {
-            func(input);
-            self.0.state.callbacks.input.set(Some(func));
-        }
+        // OLE calls these methods directly, outside any window procedure's guard.
+        guard_callback(
+            || (),
+            || {
+                if let Some(mut func) = self.0.state.callbacks.input.take() {
+                    func(input);
+                    self.0.state.callbacks.input.set(Some(func));
+                }
+            },
+        );
     }
 }
 

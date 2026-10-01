@@ -149,6 +149,11 @@ impl WindowsWindowInner {
             }
             WM_MOUSEWHEEL => self.handle_mouse_wheel_msg(handle, wparam, lparam),
             WM_MOUSEHWHEEL => self.handle_mouse_horizontal_wheel_msg(handle, wparam, lparam),
+            WM_SYSKEYUP if self.embedded => {
+                // Report it, then let the host see it too: Alt and F10 open its menus.
+                self.handle_syskeyup_msg(wparam, lparam);
+                None
+            }
             WM_SYSKEYUP => self.handle_syskeyup_msg(wparam, lparam),
             WM_KEYUP => self.handle_keyup_msg(wparam, lparam),
             WM_GPUI_KEYDOWN => self.handle_keydown_msg(wparam, lparam),
@@ -352,6 +357,8 @@ impl WindowsWindowInner {
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+        self.destroyed.set(true);
+        unsafe { windows::Win32::System::Ole::RevokeDragDrop(handle) }.log_err();
         let callback = { self.state.callbacks.close.take() };
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
@@ -364,14 +371,14 @@ impl WindowsWindowInner {
         if let Some(callback) = callback {
             callback();
         }
+        // Forget the handle now, not later: once destroyed, Windows may reuse it.
         unsafe {
-            PostMessageW(
-                Some(self.platform_window_handle),
+            SendMessageW(
+                self.platform_window_handle,
                 WM_GPUI_CLOSE_ONE_WINDOW,
-                WPARAM(self.validation_number),
-                LPARAM(handle.0 as isize),
-            )
-            .log_err();
+                Some(WPARAM(self.validation_number)),
+                Some(LPARAM(handle.0 as isize)),
+            );
         }
         Some(0)
     }
@@ -504,10 +511,13 @@ impl WindowsWindowInner {
 
     /// A child gets no `WM_DPICHANGED`; it reads its new scale when its parent's changes.
     fn handle_child_dpi_changed_msg(&self, handle: HWND) -> Option<isize> {
-        let scale_factor = unsafe { GetDpiForWindow(handle) } as f32 / USER_DEFAULT_SCREEN_DPI as f32;
+        let scale_factor =
+            unsafe { GetDpiForWindow(handle) } as f32 / USER_DEFAULT_SCREEN_DPI as f32;
         if scale_factor != self.state.scale_factor.get() {
             self.state.scale_factor.set(scale_factor);
-            self.state.direct_manipulation.set_scale_factor(scale_factor);
+            self.state
+                .direct_manipulation
+                .set_scale_factor(scale_factor);
             let mut rect = RECT::default();
             unsafe { GetClientRect(handle, &mut rect) }.log_err();
             let device_size = size(

@@ -1128,8 +1128,15 @@ fn write_dx11_bytecode_with_fxc(
             .arg(path)
             .output()
             .unwrap_or_else(|error| panic!("{CROSS_FXC} needs wslpath to convert paths: {error}"));
-        assert!(output.status.success(), "wslpath -w {} failed", path.display());
-        String::from_utf8(output.stdout).expect("wslpath printed UTF-8").trim().to_owned()
+        assert!(
+            output.status.success(),
+            "wslpath -w {} failed",
+            path.display()
+        );
+        String::from_utf8(output.stdout)
+            .expect("wslpath printed UTF-8")
+            .trim()
+            .to_owned()
     }
     let hlsl = windows_path(&out_dir.join(format!("{label}.hlsl")));
     let compile = |entry: &str, profile: &str| {
@@ -1141,7 +1148,10 @@ fn write_dx11_bytecode_with_fxc(
             .stdout(std::process::Stdio::null())
             .status()
             .unwrap_or_else(|error| panic!("failed to run {CROSS_FXC}: {error}"));
-        assert!(status.success(), "fxc failed for {label} ({entry:?}, {profile})");
+        assert!(
+            status.success(),
+            "fxc failed for {label} ({entry:?}, {profile})"
+        );
         format!("/{name}")
     };
     Dx11BytecodePaths {

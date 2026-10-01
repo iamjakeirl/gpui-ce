@@ -125,7 +125,11 @@ impl WindowsPlatform {
     /// GPUI never quits the thread's loop, exits the process or pumps messages itself, and
     /// windows handle `WM_KEYDOWN` themselves, since no GPUI loop translates keys for them.
     /// Open windows into the host's with [`WindowKind::Child`].
+    ///
+    /// It pins its module (a plugin's DLL) in the process from then on: GPUI's thread pool
+    /// work and timers, and its window classes, can't be withdrawn in time for an unload.
     pub fn new_embedded() -> Result<Self> {
+        pin_module()?;
         Self::new_with_mode(false, true)
     }
 
@@ -341,7 +345,12 @@ impl WindowsPlatform {
     }
 
     fn find_current_active_window(&self) -> Option<HWND> {
-        let active_window_hwnd = unsafe { GetActiveWindow() };
+        // An embedded platform's windows are children, never active: the focused one counts.
+        let active_window_hwnd = if self.embedded {
+            unsafe { GetFocus() }
+        } else {
+            unsafe { GetActiveWindow() }
+        };
         if active_window_hwnd.is_invalid() {
             return None;
         }
@@ -1122,11 +1131,12 @@ impl WindowsPlatformInner {
             return false;
         };
         let mut lock = all_windows.write();
-        let index = lock
+        if let Some(index) = lock
             .iter()
             .position(|handle| handle.as_raw() == target_window)
-            .unwrap();
-        lock.remove(index);
+        {
+            lock.remove(index);
+        }
 
         lock.is_empty()
     }
@@ -1262,6 +1272,15 @@ impl Drop for WindowsPlatform {
     fn drop(&mut self) {
         if let Some((stop, thread)) = self.vsync_thread.get_mut().take() {
             stop.store(true, Ordering::Release);
+            // The thread may be sending this thread a message (GPU device recovery): deliver
+            // sent messages while waiting, or both would wait for ever.
+            while !thread.is_finished() {
+                let mut msg = MSG::default();
+                unsafe {
+                    let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             thread.join().ok();
         }
         unsafe {
@@ -1296,6 +1315,19 @@ pub(crate) struct WindowCreationInfo {
     /// Shared with [`WindowsPlatformState::draw_coordinator`] and every other window.
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
     pub(crate) embedded: bool,
+}
+
+/// Keeps the module holding this code loaded until the process ends.
+fn pin_module() -> Result<()> {
+    let mut module = HMODULE::default();
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            PCWSTR(pin_module as *const () as *const u16),
+            &mut module,
+        )
+    }
+    .context("unable to pin GPUI's module")
 }
 
 /// Initializes OLE on this thread once, for good. windows-rs caches WinRT activation factories
