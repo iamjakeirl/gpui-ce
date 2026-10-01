@@ -60,6 +60,13 @@ pub struct TextSystem {
 }
 
 impl TextSystem {
+    /// Empties the pool of line wrappers. Each pooled wrapper holds the text system, so the
+    /// pool keeps it (and the platform's text system, with its GPU device) alive until it's
+    /// emptied: an application dropped without its process exiting must empty it.
+    pub(crate) fn clear_wrapper_pool(&self) {
+        self.wrapper_pool.lock().clear();
+    }
+
     /// Create a new TextSystem with the given platform text system.
     pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
         TextSystem {

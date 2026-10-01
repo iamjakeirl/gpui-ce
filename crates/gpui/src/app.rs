@@ -176,6 +176,13 @@ impl ApplicationHandle {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        // Break the text system's reference cycle (see `TextSystem::clear_wrapper_pool`).
+        self.text_system.clear_wrapper_pool();
+    }
+}
+
 /// Represents an application before it is fully launched. Once your app is
 /// configured, you'll start the app with `App::run`.
 impl Application {
