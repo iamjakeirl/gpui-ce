@@ -152,6 +152,14 @@ impl WindowsWindowInner {
             WM_SYSKEYUP => self.handle_syskeyup_msg(wparam, lparam),
             WM_KEYUP => self.handle_keyup_msg(wparam, lparam),
             WM_GPUI_KEYDOWN => self.handle_keydown_msg(wparam, lparam),
+            WM_KEYDOWN | WM_SYSKEYDOWN if self.embedded => {
+                self.handle_embedded_keydown_msg(handle, msg, wparam, lparam)
+            }
+            WM_SETFOCUS | WM_KILLFOCUS if self.is_child => {
+                // A child is never activated; its keyboard focus stands for it.
+                self.handle_activate_msg(WPARAM((msg == WM_SETFOCUS) as usize))
+            }
+            WM_DPICHANGED_AFTERPARENT if self.is_child => self.handle_child_dpi_changed_msg(handle),
             WM_CHAR => self.handle_char_msg(wparam),
             WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
@@ -460,6 +468,57 @@ impl WindowsWindowInner {
         if handled { Some(0) } else { Some(1) }
     }
 
+    /// Without GPUI's message loop, nothing sends `WM_GPUI_KEYDOWN` first, so the key arrives
+    /// here. The host's loop has already translated it: if GPUI handled the key, the
+    /// character it produced is dropped, as GPUI's own loop does by not translating.
+    fn handle_embedded_keydown_msg(
+        &self,
+        handle: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<isize> {
+        let result = self.handle_keydown_msg(wparam, lparam);
+        if result == Some(0) {
+            let (first, last) = if msg == WM_SYSKEYDOWN {
+                (WM_SYSCHAR, WM_SYSDEADCHAR)
+            } else {
+                (WM_CHAR, WM_DEADCHAR)
+            };
+            // The key's character carries the key's scan code. Only it is dropped: characters
+            // queued before it belong to earlier keys.
+            let scan_code = |lparam: LPARAM| (lparam.0 >> 16) & 0x1ff;
+            let mut pending = MSG::default();
+            unsafe {
+                if PeekMessageW(&mut pending, Some(handle), first, last, PM_NOREMOVE).as_bool()
+                    && scan_code(pending.lParam) == scan_code(lparam)
+                {
+                    let _ = PeekMessageW(&mut pending, Some(handle), first, last, PM_REMOVE);
+                }
+            }
+            return result;
+        }
+        // An unhandled system key (Alt combinations, F10) goes on to the host's menus.
+        if msg == WM_SYSKEYDOWN { None } else { result }
+    }
+
+    /// A child gets no `WM_DPICHANGED`; it reads its new scale when its parent's changes.
+    fn handle_child_dpi_changed_msg(&self, handle: HWND) -> Option<isize> {
+        let scale_factor = unsafe { GetDpiForWindow(handle) } as f32 / USER_DEFAULT_SCREEN_DPI as f32;
+        if scale_factor != self.state.scale_factor.get() {
+            self.state.scale_factor.set(scale_factor);
+            self.state.direct_manipulation.set_scale_factor(scale_factor);
+            let mut rect = RECT::default();
+            unsafe { GetClientRect(handle, &mut rect) }.log_err();
+            let device_size = size(
+                DevicePixels(rect.right - rect.left),
+                DevicePixels(rect.bottom - rect.top),
+            );
+            self.handle_size_change(device_size, scale_factor, true);
+        }
+        Some(0)
+    }
+
     fn handle_keyup_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
         let Some(input) = handle_key_event(wparam, lparam, &self.state, |keystroke, _| {
             PlatformInput::KeyUp(KeyUpEvent { keystroke })
@@ -493,6 +552,10 @@ impl WindowsWindowInner {
         lparam: LPARAM,
     ) -> Option<isize> {
         unsafe { SetCapture(handle) };
+        if self.is_child && unsafe { GetFocus() } != handle {
+            // Clicking a child doesn't give it the keyboard; take it, as an edit control does.
+            unsafe { SetFocus(Some(handle)) }.log_err();
+        }
 
         let Some(mut func) = self.state.callbacks.input.take() else {
             return Some(1);
@@ -964,7 +1027,8 @@ impl WindowsWindowInner {
     }
 
     fn handle_hit_test_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
-        if self.state.is_fullscreen() {
+        // A child has no frame or caption: all of it is client area.
+        if self.state.is_fullscreen() || self.is_child {
             return None;
         }
 

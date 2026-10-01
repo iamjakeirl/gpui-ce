@@ -56,6 +56,20 @@ impl HiLoWord for LPARAM {
     }
 }
 
+/// Runs `f`, a window procedure's or thread pool callback's work, without letting a panic
+/// unwind into Windows, which aborts the process: when GPUI is embedded in a host
+/// application, the host's. A panic is logged (the panic hook has printed it) and
+/// `fallback` gives the result.
+pub(crate) fn guard_callback<R>(fallback: impl FnOnce() -> R, f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(_) => {
+            log::error!("a panic in a Windows callback was caught");
+            fallback()
+        }
+    }
+}
+
 pub(crate) unsafe fn get_window_long(hwnd: HWND, nindex: WINDOW_LONG_PTR_INDEX) -> isize {
     #[cfg(target_pointer_width = "64")]
     unsafe {

@@ -1107,6 +1107,49 @@ fn write_dx11_bytecode(
     })
 }
 
+/// Set to the Windows SDK's `fxc.exe`, runnable from this host (for example through WSL's
+/// Windows interop), to compile DXBC when building a Windows target from another host. Paths
+/// are passed to it as Windows paths (`wslpath -w`).
+#[cfg(not(windows))]
+const CROSS_FXC: &str = "GPUI_RENDER_FXC";
+
+/// Compiles the HLSL `write_shader` already wrote to `out_dir` with an external `fxc.exe`, at
+/// the same profiles and default optimization level as the in-process `D3DCompile` above.
+#[cfg(not(windows))]
+fn write_dx11_bytecode_with_fxc(
+    out_dir: &std::path::Path,
+    label: &str,
+    pipeline: &shaders::interface::Pipeline,
+    fxc: &std::ffi::OsStr,
+) -> Dx11BytecodePaths {
+    fn windows_path(path: &std::path::Path) -> String {
+        let output = std::process::Command::new("wslpath")
+            .arg("-w")
+            .arg(path)
+            .output()
+            .unwrap_or_else(|error| panic!("{CROSS_FXC} needs wslpath to convert paths: {error}"));
+        assert!(output.status.success(), "wslpath -w {} failed", path.display());
+        String::from_utf8(output.stdout).expect("wslpath printed UTF-8").trim().to_owned()
+    }
+    let hlsl = windows_path(&out_dir.join(format!("{label}.hlsl")));
+    let compile = |entry: &str, profile: &str| {
+        let name = format!("{label}.{profile}.dxbc");
+        let status = std::process::Command::new(fxc)
+            .args(["/nologo", "/T", profile, "/E", entry, "/Fo"])
+            .arg(windows_path(&out_dir.join(&name)))
+            .arg(&hlsl)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap_or_else(|error| panic!("failed to run {CROSS_FXC}: {error}"));
+        assert!(status.success(), "fxc failed for {label} ({entry:?}, {profile})");
+        format!("/{name}")
+    };
+    Dx11BytecodePaths {
+        vertex_path: compile(pipeline.vertex_entry, "vs_5_0"),
+        fragment_path: compile(pipeline.fragment_entry, "ps_5_0"),
+    }
+}
+
 /// Set to build a Windows target from another host without DXBC, for type-checking only.
 /// The resulting `gpui_windows` cannot draw: every pipeline reports `NativeWindowsBuildRequired`.
 #[cfg(not(windows))]
@@ -1114,12 +1157,16 @@ const ALLOW_MISSING_DXBC: &str = "GPUI_RENDER_ALLOW_MISSING_DXBC";
 
 #[cfg(not(windows))]
 fn write_dx11_bytecode(
-    _out_dir: &std::path::Path,
-    _label: &str,
+    out_dir: &std::path::Path,
+    label: &str,
     _source: &str,
-    _pipeline: &shaders::interface::Pipeline,
+    pipeline: &shaders::interface::Pipeline,
 ) -> Option<Dx11BytecodePaths> {
     println!("cargo:rerun-if-env-changed={ALLOW_MISSING_DXBC}");
+    println!("cargo:rerun-if-env-changed={CROSS_FXC}");
+    if let Some(fxc) = env::var_os(CROSS_FXC) {
+        return Some(write_dx11_bytecode_with_fxc(out_dir, label, pipeline, &fxc));
+    }
     if env::var_os("CARGO_CFG_TARGET_OS").as_deref() == Some(std::ffi::OsStr::new("windows"))
         && env::var_os(ALLOW_MISSING_DXBC).is_none()
     {

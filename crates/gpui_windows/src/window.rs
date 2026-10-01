@@ -105,6 +105,10 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) main_receiver: PriorityQueueReceiver<RunnableVariant>,
     pub(crate) platform_window_handle: HWND,
     pub(crate) parent_hwnd: Option<HWND>,
+    /// A `WS_CHILD` window inside a foreign parent ([`WindowKind::Child`]).
+    pub(crate) is_child: bool,
+    /// The platform is embedded: no GPUI message loop translates keys for this window.
+    pub(crate) embedded: bool,
 }
 
 impl WindowsWindowState {
@@ -278,6 +282,8 @@ impl WindowsWindowInner {
             platform_window_handle: context.platform_window_handle,
             system_settings: WindowsSystemSettings::new(),
             parent_hwnd: context.parent_hwnd,
+            is_child: context.is_child,
+            embedded: context.embedded,
         }))
     }
 
@@ -410,6 +416,8 @@ struct WindowCreateContext {
     invalidate_devices: Arc<AtomicBool>,
     draw_coordinator: Rc<DrawCoordinator>,
     parent_hwnd: Option<HWND>,
+    is_child: bool,
+    embedded: bool,
 }
 
 impl WindowsWindow {
@@ -437,8 +445,17 @@ impl WindowsWindow {
             directx_devices,
             invalidate_devices,
             draw_coordinator,
+            embedded,
         } = creation_info;
         register_window_class(icon);
+        let child_parent = match &params.kind {
+            WindowKind::Child(rwh::RawWindowHandle::Win32(parent)) => {
+                Some(HWND(parent.hwnd.get() as _))
+            }
+            WindowKind::Child(_) => anyhow::bail!("a child window's parent must be a Win32 window"),
+            _ => None,
+        };
+        let is_child = child_parent.is_some();
         let parent_hwnd = if params.kind == WindowKind::Dialog {
             let parent_window = unsafe { GetActiveWindow() };
             if parent_window.is_invalid() {
@@ -453,11 +470,12 @@ impl WindowsWindow {
         } else {
             None
         };
-        let hide_title_bar = params
-            .titlebar
-            .as_ref()
-            .map(|titlebar| titlebar.appears_transparent)
-            .unwrap_or(true);
+        let hide_title_bar = !is_child
+            && params
+                .titlebar
+                .as_ref()
+                .map(|titlebar| titlebar.appears_transparent)
+                .unwrap_or(true);
         let window_name = HSTRING::from(
             params
                 .titlebar
@@ -467,7 +485,13 @@ impl WindowsWindow {
                 .unwrap_or(""),
         );
 
-        let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
+        let (mut dwexstyle, dwstyle) = if is_child {
+            let mut dwstyle = WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+            if params.show {
+                dwstyle |= WS_VISIBLE;
+            }
+            (WINDOW_EX_STYLE(0), dwstyle)
+        } else if params.kind == WindowKind::PopUp {
             (WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WINDOW_STYLE(0x0))
         } else {
             let mut dwstyle = WS_SYSMENU;
@@ -523,6 +547,18 @@ impl WindowsWindow {
             invalidate_devices,
             draw_coordinator,
             parent_hwnd,
+            is_child,
+            embedded,
+        };
+        // A child starts out filling its parent's client area.
+        let (x, y, cx, cy) = match child_parent {
+            Some(parent) => {
+                let mut rect = RECT::default();
+                unsafe { GetClientRect(parent, &mut rect) }
+                    .context("a child window's parent must be a window")?;
+                (0, 0, rect.right - rect.left, rect.bottom - rect.top)
+            }
+            None => (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT),
         };
         let creation_result = unsafe {
             CreateWindowExW(
@@ -530,11 +566,11 @@ impl WindowsWindow {
                 WINDOW_CLASS_NAME,
                 &window_name,
                 dwstyle,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                parent_hwnd,
+                x,
+                y,
+                cx,
+                cy,
+                child_parent.or(parent_hwnd),
                 None,
                 Some(hinstance.into()),
                 Some(&context as *const _ as *const _),
@@ -548,6 +584,11 @@ impl WindowsWindow {
         let this = this.unwrap();
 
         register_drag_drop(&this)?;
+        if is_child {
+            // The parent places and shows it; no placement, frame or taskbar state of its own.
+            this.state.border_offset.update(hwnd)?;
+            return Ok(Self(this));
+        }
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
         this.state.border_offset.update(hwnd)?;
@@ -628,6 +669,11 @@ impl PlatformWindow for WindowsWindow {
         let hwnd = self.0.hwnd;
         let bounds = gpui::bounds(self.bounds().origin, size).to_device_pixels(self.scale_factor());
         let rect = calculate_window_rect(bounds, &self.state.border_offset);
+        let flags = if self.0.is_child {
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
+        } else {
+            SWP_NOMOVE
+        };
 
         self.0
             .executor
@@ -640,7 +686,7 @@ impl PlatformWindow for WindowsWindow {
                         bounds.origin.y.0,
                         rect.right - rect.left,
                         rect.bottom - rect.top,
-                        SWP_NOMOVE,
+                        flags,
                     )
                     .context("unable to set window content size")
                     .log_err();
@@ -758,7 +804,7 @@ impl PlatformWindow for WindowsWindow {
 
                     config.pfCallback = None;
                     let mut res = std::mem::zeroed();
-                    let _ = TaskDialogIndirect(&config, Some(&mut res), None, None)
+                    let _ = task_dialog_indirect(&config, &mut res)
                         .context("unable to create task dialog")
                         .log_err();
 
@@ -779,6 +825,16 @@ impl PlatformWindow for WindowsWindow {
             return false;
         }
         let hwnd = self.0.hwnd;
+        if self.0.is_child {
+            // Never bring the host forward or fake input: take the keyboard focus only.
+            self.0
+                .executor
+                .spawn(async move {
+                    unsafe { SetFocus(Some(hwnd)).ok() };
+                })
+                .detach();
+            return true;
+        }
         let this = self.0.clone();
         self.0
             .executor
@@ -854,6 +910,9 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn is_active(&self) -> bool {
+        if self.0.is_child {
+            return self.0.hwnd == unsafe { GetFocus() };
+        }
         self.0.hwnd == unsafe { GetActiveWindow() }
     }
 
@@ -1465,7 +1524,10 @@ unsafe extern "system" fn window_procedure(
         let window_params = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
         let window_creation_context = window_params.lpCreateParams as *mut WindowCreateContext;
         let window_creation_context = unsafe { &mut *window_creation_context };
-        return match WindowsWindowInner::new(window_creation_context, hwnd, window_params) {
+        return match guard_callback(
+            || Err(anyhow::anyhow!("creating the window panicked")),
+            || WindowsWindowInner::new(window_creation_context, hwnd, window_params),
+        ) {
             Ok(window_state) => {
                 let weak = Box::new(Rc::downgrade(&window_state));
                 unsafe { set_window_long(hwnd, GWLP_USERDATA, Box::into_raw(weak) as isize) };
@@ -1485,7 +1547,10 @@ unsafe extern "system" fn window_procedure(
     }
     let inner = unsafe { &*ptr };
     let result = if let Some(inner) = inner.upgrade() {
-        inner.handle_msg(hwnd, msg, wparam, lparam)
+        guard_callback(
+            || unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+            || inner.handle_msg(hwnd, msg, wparam, lparam),
+        )
     } else {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     };
@@ -1512,7 +1577,26 @@ pub(crate) fn window_from_hwnd(hwnd: HWND) -> Option<Rc<WindowsWindowInner>> {
     }
 }
 
-fn get_module_handle() -> HMODULE {
+/// Calls `TaskDialogIndirect`, which only Common Controls 6 has; a process gets it through
+/// its manifest. Looking it up at run time, rather than importing it, lets a process without
+/// one (or a plugin DLL inside such a host) load: only the prompt fails.
+unsafe fn task_dialog_indirect(config: &TASKDIALOGCONFIG, button: &mut i32) -> Result<()> {
+    type TaskDialogIndirectFn = unsafe extern "system" fn(
+        *const TASKDIALOGCONFIG,
+        *mut i32,
+        *mut i32,
+        *mut BOOL,
+    ) -> HRESULT;
+    let module = unsafe { LoadLibraryW(w!("comctl32.dll")) }?;
+    let function = unsafe { GetProcAddress(module, s!("TaskDialogIndirect")) }
+        .context("task dialogs need Common Controls 6")?;
+    // SAFETY: TaskDialogIndirect's signature, from the Windows SDK.
+    let function: TaskDialogIndirectFn = unsafe { std::mem::transmute(function) };
+    unsafe { function(config, button, std::ptr::null_mut(), std::ptr::null_mut()) }.ok()?;
+    Ok(())
+}
+
+pub(crate) fn get_module_handle() -> HMODULE {
     unsafe {
         let mut h_module = std::mem::zeroed();
         GetModuleHandleExW(

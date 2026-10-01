@@ -177,7 +177,7 @@ unsafe extern "system" fn run_work_callback(
     context: *mut c_void,
 ) {
     let runnable = unsafe { RunnableVariant::from_raw(NonNull::new_unchecked(context as *mut ())) };
-    WindowsDispatcher::execute_runnable(runnable);
+    crate::guard_callback(|| (), || WindowsDispatcher::execute_runnable(runnable));
 }
 
 unsafe extern "system" fn run_timer_callback(
@@ -186,6 +186,6 @@ unsafe extern "system" fn run_timer_callback(
     timer: PTP_TIMER,
 ) {
     let runnable = unsafe { RunnableVariant::from_raw(NonNull::new_unchecked(context as *mut ())) };
-    WindowsDispatcher::execute_runnable(runnable);
+    crate::guard_callback(|| (), || WindowsDispatcher::execute_runnable(runnable));
     unsafe { CloseThreadpoolTimer(timer) };
 }

@@ -2359,6 +2359,13 @@ pub enum WindowKind {
     /// A window that appears on top of its parent window and blocks interaction with it
     /// until the modal window is closed
     Dialog,
+
+    /// A child window (`WS_CHILD`) inside a window another framework or process owns, such as
+    /// a plugin host's editor frame. It starts out filling the parent's client area
+    /// ([`WindowOptions::window_bounds`] is ignored); the embedder resizes it with the parent
+    /// ([`Window::resize`](crate::Window::resize)), and destroying the parent destroys it.
+    #[cfg(target_os = "windows")]
+    Child(raw_window_handle::RawWindowHandle),
 }
 
 /// The appearance of the window, as defined by the operating system.

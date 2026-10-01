@@ -13,7 +13,9 @@ workspace = true
 ignored = ["gpui"]
 
 [dependencies]
-gpui.workspace = true
+# Not the workspace's: its default features embed an application manifest, which an
+# embedder (a plugin DLL) doesn't want.
+gpui = { path = "../gpui", version = "0.2.2", package = "gpui-ce", default-features = false }
 unicode-segmentation.workspace = true
 palette.workspace = true
 smallvec.workspace = true

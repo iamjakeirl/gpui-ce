@@ -8,6 +8,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    thread::JoinHandle,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -37,6 +38,11 @@ pub struct WindowsPlatform {
     raw_window_handles: Arc<RwLock<SmallVec<[SafeHwnd; 4]>>>,
     // The below members will never change throughout the entire lifecycle of the app.
     headless: bool,
+    /// Embedded in a host application that owns the thread's message loop (see
+    /// [`WindowsPlatform::new_embedded`]).
+    embedded: bool,
+    /// The vsync thread's stop flag and handle; it is stopped and joined when the platform drops.
+    vsync_thread: RefCell<Option<(Arc<AtomicBool>, JoinHandle<()>)>>,
     icon: HICON,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
@@ -61,6 +67,7 @@ struct WindowsPlatformInner {
     validation_number: usize,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
     dispatcher: Arc<WindowsDispatcher>,
+    embedded: bool,
 }
 
 pub(crate) struct WindowsPlatformState {
@@ -109,8 +116,40 @@ impl WindowsPlatformState {
 
 impl WindowsPlatform {
     pub fn new(headless: bool) -> Result<Self> {
-        unsafe {
-            OleInitialize(None).context("unable to initialize Windows OLE")?;
+        Self::new_with_mode(headless, false)
+    }
+
+    /// A platform for GPUI inside a host application that owns the UI thread and its message
+    /// loop, such as an audio plugin's editor. [`Platform::run`] calls the launch callback and
+    /// returns (use [`Application::run_embedded`]); the host's loop dispatches GPUI's messages.
+    /// GPUI never quits the thread's loop, exits the process or pumps messages itself, and
+    /// windows handle `WM_KEYDOWN` themselves, since no GPUI loop translates keys for them.
+    /// Open windows into the host's with [`WindowKind::Child`].
+    pub fn new_embedded() -> Result<Self> {
+        Self::new_with_mode(false, true)
+    }
+
+    /// Runs the queued foreground tasks now, without the usual time budget (at most a
+    /// thousand, so a task that keeps queueing itself can't hold the host). An embedder calls
+    /// it after closing a window, so the window is destroyed before control returns to the
+    /// host.
+    pub fn flush_main_thread_tasks(&self) {
+        let mut main_receiver = self.inner.main_receiver.clone();
+        for _ in 0..1000 {
+            match main_receiver.try_pop() {
+                Ok(Some(runnable)) => WindowsDispatcher::execute_runnable(runnable),
+                _ => break,
+            }
+        }
+    }
+
+    fn new_with_mode(headless: bool, embedded: bool) -> Result<Self> {
+        if embedded {
+            initialize_ole_for_thread()?;
+        } else {
+            unsafe {
+                OleInitialize(None).context("unable to initialize Windows OLE")?;
+            }
         }
         let (directx_devices, text_system, direct_write_text_system) = if !headless {
             let devices = DirectXDevices::new().context("Creating DirectX devices")?;
@@ -147,6 +186,7 @@ impl WindowsPlatform {
             main_receiver: Some(main_receiver),
             directx_devices,
             dispatcher: None,
+            embedded,
         };
         let result = unsafe {
             CreateWindowExW(
@@ -160,7 +200,7 @@ impl WindowsPlatform {
                 0,
                 Some(HWND_MESSAGE),
                 None,
-                None,
+                Some(get_module_handle().into()),
                 Some(&raw const context as *const _),
             )
         };
@@ -198,6 +238,8 @@ impl WindowsPlatform {
             handle,
             raw_window_handles,
             headless,
+            embedded,
+            vsync_thread: RefCell::new(None),
             icon,
             background_executor,
             foreground_executor,
@@ -245,6 +287,7 @@ impl WindowsPlatform {
             directx_devices: self.inner.state.directx_devices.borrow().clone().unwrap(),
             invalidate_devices: self.invalidate_devices.clone(),
             draw_coordinator: self.inner.state.draw_coordinator.clone(),
+            embedded: self.embedded,
         }
     }
 
@@ -322,13 +365,18 @@ impl WindowsPlatform {
         let all_windows = Arc::downgrade(&self.raw_window_handles);
         let text_system = Arc::downgrade(direct_write_text_system);
         let invalidate_devices = self.invalidate_devices.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
 
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("VSyncProvider".to_owned())
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
                 loop {
                     vsync_provider.wait_for_vsync();
+                    if stop_thread.load(Ordering::Acquire) {
+                        break;
+                    }
                     if check_device_lost(&directx_device.device)
                         || invalidate_devices.fetch_and(false, Ordering::Acquire)
                     {
@@ -353,6 +401,7 @@ impl WindowsPlatform {
                 }
             })
             .unwrap();
+        *self.vsync_thread.borrow_mut() = Some((stop, thread));
     }
 }
 
@@ -449,6 +498,10 @@ impl Platform for WindowsPlatform {
         if !self.headless {
             self.begin_vsync_thread();
         }
+        if self.embedded {
+            // The host's message loop dispatches our messages.
+            return;
+        }
 
         let mut msg = MSG::default();
         unsafe {
@@ -469,6 +522,10 @@ impl Platform for WindowsPlatform {
     }
 
     fn quit(&self) {
+        if self.embedded {
+            // The loop and the process belong to the host.
+            return;
+        }
         self.foreground_executor()
             .spawn(async { unsafe { PostQuitMessage(0) } })
             .detach();
@@ -977,6 +1034,7 @@ impl WindowsPlatformInner {
                 .main_receiver
                 .take()
                 .context("missing main receiver")?,
+            embedded: context.embedded,
         }))
     }
 
@@ -1037,6 +1095,10 @@ impl WindowsPlatformInner {
     }
 
     fn handle_end_session(&self) -> Option<isize> {
+        if self.embedded {
+            // The host decides how its process ends.
+            return Some(0);
+        }
         let mut shutdown_completed = false;
         self.with_callback(
             |callbacks| &callbacks.quit,
@@ -1076,6 +1138,22 @@ impl WindowsPlatformInner {
         let start = std::time::Instant::now();
         'tasks: loop {
             'timeout_loop: loop {
+                if start.elapsed().as_millis() >= MAIN_TASK_TIMEOUT && self.embedded {
+                    // Never pump the host's messages: post ourselves again and let its loop run.
+                    unsafe {
+                        if PostMessageW(
+                            Some(self.dispatcher.platform_window_handle.as_raw()),
+                            WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD,
+                            WPARAM(self.validation_number),
+                            LPARAM(0),
+                        )
+                        .is_err()
+                        {
+                            self.dispatcher.wake_posted.store(false, Ordering::Release);
+                        }
+                    }
+                    break 'tasks;
+                }
                 if start.elapsed().as_millis() >= MAIN_TASK_TIMEOUT {
                     log::debug!("foreground task timeout reached");
                     // we spent our budget on gpui tasks, we likely have a lot of work queued so drain system events first to stay responsive
@@ -1182,6 +1260,10 @@ impl WindowsPlatformInner {
 
 impl Drop for WindowsPlatform {
     fn drop(&mut self) {
+        if let Some((stop, thread)) = self.vsync_thread.get_mut().take() {
+            stop.store(true, Ordering::Release);
+            thread.join().ok();
+        }
         unsafe {
             if let Some(notification) = self.suspend_resume_notification.borrow_mut().take() {
                 // SAFETY: notification was returned by RegisterSuspendResumeNotification.
@@ -1190,7 +1272,9 @@ impl Drop for WindowsPlatform {
             DestroyWindow(self.handle)
                 .context("Destroying platform window")
                 .log_err();
-            OleUninitialize();
+            if !self.embedded {
+                OleUninitialize();
+            }
         }
     }
 }
@@ -1211,6 +1295,22 @@ pub(crate) struct WindowCreationInfo {
     pub(crate) invalidate_devices: Arc<AtomicBool>,
     /// Shared with [`WindowsPlatformState::draw_coordinator`] and every other window.
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
+    pub(crate) embedded: bool,
+}
+
+/// Initializes OLE on this thread once, for good. windows-rs caches WinRT activation factories
+/// (such as `UISettings`') in statics, which are only valid while COM stays loaded on the
+/// thread: an embedded platform that uninitialized OLE as it dropped, on a host thread with no
+/// other COM user, would leave the next platform a dead factory.
+fn initialize_ole_for_thread() -> Result<()> {
+    thread_local! {
+        static OLE_INITIALIZED: Cell<bool> = const { Cell::new(false) };
+    }
+    if !OLE_INITIALIZED.get() {
+        unsafe { OleInitialize(None) }.context("unable to initialize Windows OLE")?;
+        OLE_INITIALIZED.set(true);
+    }
+    Ok(())
 }
 
 struct PlatformWindowCreateContext {
@@ -1221,6 +1321,7 @@ struct PlatformWindowCreateContext {
     main_receiver: Option<PriorityQueueReceiver<RunnableVariant>>,
     directx_devices: Option<DirectXDevices>,
     dispatcher: Option<Arc<WindowsDispatcher>>,
+    embedded: bool,
 }
 
 fn has_package_identity() -> bool {
@@ -1493,9 +1594,12 @@ fn handle_gpu_device_lost(
 const PLATFORM_WINDOW_CLASS_NAME: PCWSTR = w!("Zed::PlatformWindow");
 
 fn register_platform_window_class() {
+    // Registered for this module, not the process: another module in the process (another
+    // plugin built with GPUI) registers its own class under the same name.
     let wc = WNDCLASSW {
         lpfnWndProc: Some(window_procedure),
         lpszClassName: PCWSTR(PLATFORM_WINDOW_CLASS_NAME.as_ptr()),
+        hInstance: get_module_handle().into(),
         ..Default::default()
     };
     unsafe { RegisterClassW(&wc) };
@@ -1522,7 +1626,10 @@ unsafe extern "system" fn window_procedure(
             creation_context.validation_number,
         )));
 
-        return match WindowsPlatformInner::new(creation_context) {
+        return match guard_callback(
+            || Err(anyhow!("creating the platform window panicked")),
+            || WindowsPlatformInner::new(creation_context),
+        ) {
             Ok(inner) => {
                 let weak = Box::new(Rc::downgrade(&inner));
                 unsafe { set_window_long(hwnd, GWLP_USERDATA, Box::into_raw(weak) as isize) };
@@ -1542,15 +1649,10 @@ unsafe extern "system" fn window_procedure(
     }
     let inner = unsafe { &*ptr };
     let result = if let Some(inner) = inner.upgrade() {
-        if cfg!(debug_assertions) {
-            let inner = std::panic::AssertUnwindSafe(inner);
-            match std::panic::catch_unwind(|| { inner }.handle_msg(hwnd, msg, wparam, lparam)) {
-                Ok(result) => result,
-                Err(_) => std::process::abort(),
-            }
-        } else {
-            inner.handle_msg(hwnd, msg, wparam, lparam)
-        }
+        guard_callback(
+            || unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+            || inner.handle_msg(hwnd, msg, wparam, lparam),
+        )
     } else {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     };
