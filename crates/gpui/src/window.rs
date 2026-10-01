@@ -2619,6 +2619,14 @@ impl Window {
         self.platform_window.resize(size);
     }
 
+    /// Draw at this scale factor from now on, instead of the display's: for a window
+    /// embedded in a host's ([`WindowKind::Child`]) whose host decides the scale, such as a
+    /// plugin's editor. The window keeps its size in physical pixels; the change arrives
+    /// like a resize. Platforms without embedded windows ignore it.
+    pub fn set_scale_factor(&mut self, scale_factor: f32) {
+        self.platform_window.set_scale_factor(scale_factor);
+    }
+
     /// Returns whether or not the window is currently fullscreen
     pub fn is_fullscreen(&self) -> bool {
         self.platform_window.is_fullscreen()

@@ -115,6 +115,11 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) destroyed: Cell<bool>,
     /// The platform's list of window handles, which this window leaves as it's destroyed.
     pub(crate) raw_window_handles: std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    /// The platform is poisoned (see `WindowsPlatform::is_poisoned`).
+    pub(crate) poisoned: Rc<Cell<bool>>,
+    /// The embedder set the scale ([`PlatformWindow::set_scale_factor`]): DPI changes don't
+    /// change it.
+    pub(crate) fixed_scale: Cell<bool>,
 }
 
 impl WindowsWindowState {
@@ -292,6 +297,8 @@ impl WindowsWindowInner {
             embedded: context.embedded,
             destroyed: Cell::new(false),
             raw_window_handles: context.raw_window_handles.clone(),
+            poisoned: context.poisoned.clone(),
+            fixed_scale: Cell::new(false),
         }))
     }
 
@@ -427,6 +434,7 @@ struct WindowCreateContext {
     is_child: bool,
     embedded: bool,
     raw_window_handles: std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    poisoned: Rc<Cell<bool>>,
 }
 
 impl WindowsWindow {
@@ -456,6 +464,7 @@ impl WindowsWindow {
             draw_coordinator,
             embedded,
             raw_window_handles,
+            poisoned,
         } = creation_info;
         register_window_class(icon);
         let child_parent = match &params.kind {
@@ -560,6 +569,7 @@ impl WindowsWindow {
             is_child,
             embedded,
             raw_window_handles,
+            poisoned,
         };
         // A child starts out filling its parent's client area.
         let (x, y, cx, cy) = match child_parent {
@@ -677,9 +687,6 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
-        let hwnd = self.0.hwnd;
-        let bounds = gpui::bounds(self.bounds().origin, size).to_device_pixels(self.scale_factor());
-        let rect = calculate_window_rect(bounds, &self.state.border_offset);
         let flags = if self.0.is_child {
             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE
         } else {
@@ -693,9 +700,13 @@ impl PlatformWindow for WindowsWindow {
                 if this.destroyed.get() {
                     return;
                 }
+                // At the scale when it runs: a scale change queued before it applies first.
+                let bounds = gpui::bounds(this.state.bounds().origin, size)
+                    .to_device_pixels(this.state.scale_factor.get());
+                let rect = calculate_window_rect(bounds, &this.state.border_offset);
                 unsafe {
                     SetWindowPos(
-                        hwnd,
+                        this.hwnd,
                         None,
                         bounds.origin.x.0,
                         bounds.origin.y.0,
@@ -712,6 +723,34 @@ impl PlatformWindow for WindowsWindow {
 
     fn scale_factor(&self) -> f32 {
         self.state.scale_factor.get()
+    }
+
+    fn set_scale_factor(&self, scale_factor: f32) {
+        if !self.0.is_child {
+            return;
+        }
+        self.0.fixed_scale.set(true);
+        // Later, outside the caller's update: the change reaches GPUI as a resize.
+        let this = self.0.clone();
+        self.0
+            .executor
+            .spawn(async move {
+                if this.destroyed.get() || this.state.scale_factor.get() == scale_factor {
+                    return;
+                }
+                this.state.scale_factor.set(scale_factor);
+                this.state
+                    .direct_manipulation
+                    .set_scale_factor(scale_factor);
+                let mut rect = RECT::default();
+                unsafe { GetClientRect(this.hwnd, &mut rect) }.log_err();
+                let device_size = size(
+                    DevicePixels(rect.right - rect.left),
+                    DevicePixels(rect.bottom - rect.top),
+                );
+                this.handle_size_change(device_size, scale_factor, false);
+            })
+            .detach();
     }
 
     fn appearance(&self) -> WindowAppearance {
@@ -1571,10 +1610,21 @@ unsafe extern "system" fn window_procedure(
     }
     let inner = unsafe { &*ptr };
     let result = if let Some(inner) = inner.upgrade() {
-        guard_callback(
-            || unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
-            || inner.handle_msg(hwnd, msg, wparam, lparam),
-        )
+        if inner.poisoned.get() {
+            // No more GPUI code: only what keeps the handle bookkeeping right.
+            if msg == WM_DESTROY {
+                inner.forget_destroyed_window(hwnd);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        } else {
+            guard_callback(
+                || {
+                    poison(&inner.poisoned, &inner.raw_window_handles);
+                    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+                },
+                || inner.handle_msg(hwnd, msg, wparam, lparam),
+            )
+        }
     } else {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     };

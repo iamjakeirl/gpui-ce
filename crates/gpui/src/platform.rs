@@ -874,6 +874,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn content_size(&self) -> Size<Pixels>;
     fn resize(&mut self, size: Size<Pixels>);
     fn scale_factor(&self) -> f32;
+    /// Uses this scale factor from now on, instead of the display's: for a window an
+    /// embedder places in its own ([`WindowKind::Child`]), whose host knows the scale it
+    /// draws at. Platforms without embedded windows ignore it.
+    fn set_scale_factor(&self, _scale_factor: f32) {}
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn mouse_position(&self) -> Point<Pixels>;

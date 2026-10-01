@@ -284,7 +284,7 @@ impl WindowsWindowInner {
         Some(0)
     }
 
-    fn handle_size_change(
+    pub(crate) fn handle_size_change(
         &self,
         device_size: Size<DevicePixels>,
         scale_factor: f32,
@@ -362,9 +362,20 @@ impl WindowsWindowInner {
         if should_close { None } else { Some(0) }
     }
 
-    fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+    /// What `WM_DESTROY` must do even when no GPUI code may run: revoke drag and drop and
+    /// forget the handle, which Windows may reuse once the window is gone.
+    pub(crate) fn forget_destroyed_window(&self, handle: HWND) {
         self.destroyed.set(true);
         unsafe { windows::Win32::System::Ole::RevokeDragDrop(handle) }.log_err();
+        if let Some(all_windows) = self.raw_window_handles.upgrade() {
+            all_windows
+                .write()
+                .retain(|window| window.as_raw() != handle);
+        }
+    }
+
+    fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+        self.forget_destroyed_window(handle);
         let callback = { self.state.callbacks.close.take() };
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
@@ -376,13 +387,6 @@ impl WindowsWindowInner {
 
         if let Some(callback) = callback {
             callback();
-        }
-        // Leave the platform's list now, not later: once destroyed, Windows may reuse the
-        // handle. (The platform may be gone already.)
-        if let Some(all_windows) = self.raw_window_handles.upgrade() {
-            all_windows
-                .write()
-                .retain(|window| window.as_raw() != handle);
         }
         Some(0)
     }
@@ -513,8 +517,12 @@ impl WindowsWindowInner {
         if msg == WM_SYSKEYDOWN { None } else { result }
     }
 
-    /// A child gets no `WM_DPICHANGED`; it reads its new scale when its parent's changes.
+    /// A child gets no `WM_DPICHANGED`; it reads its new scale when its parent's changes,
+    /// unless the embedder sets its scale.
     fn handle_child_dpi_changed_msg(&self, handle: HWND) -> Option<isize> {
+        if self.fixed_scale.get() {
+            return Some(0);
+        }
         let scale_factor =
             unsafe { GetDpiForWindow(handle) } as f32 / USER_DEFAULT_SCREEN_DPI as f32;
         if scale_factor != self.state.scale_factor.get() {

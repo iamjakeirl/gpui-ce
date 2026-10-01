@@ -82,6 +82,9 @@ pub(crate) struct WindowsPlatformState {
     /// thread; see [`DrawCoordinator`].
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
     directx_devices: RefCell<Option<DirectXDevices>>,
+    /// A panic was caught in this platform's window procedures: its state may be broken, so
+    /// its windows are hidden and run no more GPUI code (see [`WindowsPlatform::is_poisoned`]).
+    pub(crate) poisoned: Rc<Cell<bool>>,
 }
 
 #[derive(Default)]
@@ -110,6 +113,7 @@ impl WindowsPlatformState {
             draw_coordinator: Rc::new(DrawCoordinator::new()),
             directx_devices: RefCell::new(directx_devices),
             menus: RefCell::new(Vec::new()),
+            poisoned: Rc::new(Cell::new(false)),
         }
     }
 }
@@ -138,12 +142,33 @@ impl WindowsPlatform {
     /// it after closing a window, so the window is destroyed before control returns to the
     /// host.
     pub fn flush_main_thread_tasks(&self) {
+        if self.is_poisoned() {
+            return;
+        }
         let mut main_receiver = self.inner.main_receiver.clone();
         for _ in 0..1000 {
             match main_receiver.try_pop() {
                 Ok(Some(runnable)) => WindowsDispatcher::execute_runnable(runnable),
                 _ => break,
             }
+        }
+    }
+
+    /// Whether a panic was caught in one of this platform's window procedures. Its windows are
+    /// then hidden and get no more GPUI calls, and its tasks don't run: an embedder ends the
+    /// application (dropping it without calling into it) and starts a new one when it needs
+    /// GPUI again.
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.state.poisoned.get()
+    }
+
+    /// Destroys this platform's windows now, without GPUI's own closing path: for an embedder
+    /// closing a view of a poisoned application ([`Self::is_poisoned`]).
+    pub fn destroy_windows(&self) {
+        let windows: SmallVec<[SafeHwnd; 4]> =
+            self.raw_window_handles.read().iter().copied().collect();
+        for window in windows {
+            unsafe { DestroyWindow(window.as_raw()) }.log_err();
         }
     }
 
@@ -293,6 +318,7 @@ impl WindowsPlatform {
             draw_coordinator: self.inner.state.draw_coordinator.clone(),
             embedded: self.embedded,
             raw_window_handles: Arc::downgrade(&self.raw_window_handles),
+            poisoned: self.inner.state.poisoned.clone(),
         }
     }
 
@@ -1320,6 +1346,27 @@ pub(crate) struct WindowCreationInfo {
     pub(crate) embedded: bool,
     /// The platform's list of window handles, which a window leaves as it's destroyed.
     pub(crate) raw_window_handles: std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    pub(crate) poisoned: Rc<Cell<bool>>,
+}
+
+/// Marks a platform poisoned after a caught panic and hides its windows: what the panic
+/// interrupted may have left GPUI's state inconsistent, so nothing should reach it again.
+pub(crate) fn poison(
+    poisoned: &Cell<bool>,
+    windows: &std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+) {
+    if poisoned.replace(true) {
+        return;
+    }
+    log::error!("a panic was caught; GPUI's windows are disabled until they are reopened");
+    if let Some(windows) = windows.upgrade() {
+        let windows: SmallVec<[SafeHwnd; 4]> = windows.read().iter().copied().collect();
+        for window in windows {
+            unsafe {
+                let _ = ShowWindow(window.as_raw(), SW_HIDE);
+            }
+        }
+    }
 }
 
 /// Keeps the module holding this code loaded until the process ends.
@@ -1708,10 +1755,18 @@ unsafe extern "system" fn window_procedure(
     }
     let inner = unsafe { &*ptr };
     let result = if let Some(inner) = inner.upgrade() {
-        guard_callback(
-            || unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
-            || inner.handle_msg(hwnd, msg, wparam, lparam),
-        )
+        if inner.state.poisoned.get() {
+            // Tasks of a poisoned platform no longer run.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        } else {
+            guard_callback(
+                || {
+                    poison(&inner.state.poisoned, &inner.raw_window_handles);
+                    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+                },
+                || inner.handle_msg(hwnd, msg, wparam, lparam),
+            )
+        }
     } else {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     };
