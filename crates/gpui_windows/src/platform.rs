@@ -142,14 +142,12 @@ impl WindowsPlatform {
     /// it after closing a window, so the window is destroyed before control returns to the
     /// host.
     pub fn flush_main_thread_tasks(&self) {
-        if self.is_poisoned() {
-            return;
-        }
         let mut main_receiver = self.inner.main_receiver.clone();
         for _ in 0..1000 {
             // A task that panicked (here, or in a window procedure it called) poisoned the
             // platform: run no more.
             if self.is_poisoned() {
+                self.inner.reap_queued();
                 return;
             }
             match main_receiver.try_pop() {
@@ -224,11 +222,7 @@ impl WindowsPlatform {
             directx_devices,
             dispatcher: None,
             embedded,
-            reaper: if embedded {
-                Some(reaper_window()?)
-            } else {
-                None
-            },
+            reaper: if embedded { Some(reaper()?) } else { None },
         };
         let result = unsafe {
             CreateWindowExW(
@@ -1183,6 +1177,27 @@ impl WindowsPlatformInner {
     }
 
     #[inline]
+    /// Hands every queued task to the reaper (a poisoned platform runs none, and dropping them
+    /// here could drop the platform inside its own window procedure), and re-arms the wake-up,
+    /// so later ones arrive here too.
+    fn reap_queued(&self) {
+        let mut main_receiver = self.main_receiver.clone();
+        loop {
+            while let Ok(Some(runnable)) = main_receiver.try_pop() {
+                self.dispatcher.reap(runnable);
+            }
+            self.dispatcher.wake_posted.store(false, Ordering::Release);
+            // One may have arrived before the flag cleared, without posting a wake-up.
+            match main_receiver.try_pop() {
+                Ok(Some(runnable)) => {
+                    self.dispatcher.wake_posted.store(true, Ordering::Release);
+                    self.dispatcher.reap(runnable);
+                }
+                _ => break,
+            }
+        }
+    }
+
     fn run_foreground_task(&self) -> Option<isize> {
         const MAIN_TASK_TIMEOUT: u128 = 10;
 
@@ -1242,6 +1257,7 @@ impl WindowsPlatformInner {
                     break 'tasks;
                 }
                 if self.state.poisoned.get() {
+                    self.reap_queued();
                     break 'tasks;
                 }
                 let mut main_receiver = self.main_receiver.clone();
@@ -1314,8 +1330,9 @@ impl WindowsPlatformInner {
 
 impl Drop for WindowsPlatform {
     fn drop(&mut self) {
-        // Drop the tasks still queued without running them: they may hold windows' state,
-        // which holds the queue, and nothing will run them now.
+        // Take no more tasks, and drop those still queued without running them: they may hold
+        // windows' state, which holds the queue, and nothing will run them now.
+        self.inner.dispatcher.close();
         let mut main_receiver = self.inner.main_receiver.clone();
         guard_callback(
             || (),
@@ -1433,7 +1450,7 @@ struct PlatformWindowCreateContext {
     directx_devices: Option<DirectXDevices>,
     dispatcher: Option<Arc<WindowsDispatcher>>,
     embedded: bool,
-    reaper: Option<SafeHwnd>,
+    reaper: Option<Reaper>,
 }
 
 fn has_package_identity() -> bool {
@@ -1785,12 +1802,18 @@ unsafe extern "system" fn window_procedure(
     let inner = unsafe { &*ptr };
     let result = if let Some(inner) = inner.upgrade() {
         if inner.state.poisoned.get() {
-            // Tasks of a poisoned platform no longer run.
+            // Tasks of a poisoned platform no longer run; the reaper drops them.
+            if msg == WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD && wparam.0 == inner.validation_number
+            {
+                inner.reap_queued();
+            }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         } else {
             guard_callback(
                 || {
                     poison(&inner.state.poisoned, &inner.raw_window_handles);
+                    // A task may have panicked with the wake-up still marked posted.
+                    inner.reap_queued();
                     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
                 },
                 || inner.handle_msg(hwnd, msg, wparam, lparam),

@@ -2,13 +2,17 @@ use std::{
     cell::Cell,
     ffi::c_void,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread::{ThreadId, current},
     time::Duration,
 };
 
 use anyhow::Context;
 use gpui_util::ResultExt;
+use parking_lot::RwLock;
 use windows::{
     Win32::{
         Foundation::{FILETIME, LPARAM, LRESULT, WPARAM},
@@ -20,16 +24,16 @@ use windows::{
             TP_CALLBACK_PRIORITY_LOW, TP_CALLBACK_PRIORITY_NORMAL, TrySubmitThreadpoolCallback,
         },
         UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, HWND_MESSAGE, PostMessageW, RegisterClassW,
-            WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+            CreateWindowExW, DefWindowProcW, GWLP_USERDATA, HWND_MESSAGE, PostMessageW,
+            RegisterClassW, RegisterWindowMessageW, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
         },
     },
     core::{PCWSTR, w},
 };
 
 use crate::{
-    HWND, SafeHwnd, WM_GPUI_DROP_RUNNABLE, WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD,
-    get_module_handle,
+    HWND, SafeHwnd, WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD, get_module_handle, get_window_long,
+    set_window_long,
 };
 use gpui::{
     PlatformDispatcher, Priority, PriorityQueueSender, RunnableVariant, TimerResolutionGuard,
@@ -41,8 +45,11 @@ pub(crate) struct WindowsDispatcher {
     main_thread_id: ThreadId,
     pub(crate) platform_window_handle: SafeHwnd,
     validation_number: usize,
-    /// An embedded platform's [`reaper_window`].
-    reaper: Option<SafeHwnd>,
+    /// Whether the platform takes main-thread work: false once it has ended. Dispatching holds
+    /// it for reading, so once [`Self::close`] returns, nothing more reaches the queue.
+    open: RwLock<bool>,
+    /// An embedded platform's thread's [`reaper`].
+    reaper: Option<Reaper>,
 }
 
 impl WindowsDispatcher {
@@ -50,7 +57,7 @@ impl WindowsDispatcher {
         main_sender: PriorityQueueSender<RunnableVariant>,
         platform_window_handle: HWND,
         validation_number: usize,
-        reaper: Option<SafeHwnd>,
+        reaper: Option<Reaper>,
     ) -> Self {
         let main_thread_id = current().id();
         let platform_window_handle = platform_window_handle.into();
@@ -60,6 +67,7 @@ impl WindowsDispatcher {
             main_thread_id,
             platform_window_handle,
             validation_number,
+            open: RwLock::new(true),
             reaper,
             wake_posted: AtomicBool::new(false),
         }
@@ -102,6 +110,46 @@ impl WindowsDispatcher {
         }
     }
 
+    /// Takes no more main-thread work: runnables dispatched from now on are reaped
+    /// ([`Self::reap`]). The caller deals with those already queued.
+    pub(crate) fn close(&self) {
+        *self.open.write() = false;
+    }
+
+    /// Disposes of a runnable that the platform will never run (it has ended, or a panic
+    /// poisoned it).
+    pub(crate) fn reap(&self, runnable: RunnableVariant) {
+        // NOTE: Runnable may wrap a Future that is !Send.
+        //
+        // This is usually safe because we only poll it on the main thread.
+        // However if the send fails, we know that:
+        // 1. main_receiver has been dropped (which implies the app is shutting down)
+        // 2. we are on a background thread.
+        // It is not safe to drop something !Send on the wrong thread, and
+        // the app will exit soon anyway, so we must forget the runnable.
+        //
+        // An embedded platform's thread is the host's, which lives on and may start GPUI
+        // again: its reaper drops the runnable there instead.
+        let message = reaper_message();
+        match self.reaper {
+            Some(reaper) if message != 0 => {
+                let runnable = runnable.into_raw().as_ptr();
+                // If the post fails (the thread has ended, or its queue is full), the
+                // runnable leaks: no other thread may drop it.
+                unsafe {
+                    PostMessageW(
+                        Some(reaper.window.as_raw()),
+                        message,
+                        WPARAM(reaper.generation),
+                        LPARAM(runnable as isize),
+                    )
+                    .log_err();
+                }
+            }
+            _ => std::mem::forget(runnable),
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn execute_runnable(runnable: RunnableVariant) {
         let location = runnable.metadata().location;
@@ -130,6 +178,11 @@ impl PlatformDispatcher for WindowsDispatcher {
     }
 
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, priority: Priority) {
+        let open = self.open.read();
+        if !*open {
+            drop(open);
+            return self.reap(runnable);
+        }
         match self.main_sender.send(priority, runnable) {
             Ok(_) => {
                 if !self.wake_posted.swap(true, Ordering::AcqRel) {
@@ -145,33 +198,8 @@ impl PlatformDispatcher for WindowsDispatcher {
                 }
             }
             Err(runnable) => {
-                // NOTE: Runnable may wrap a Future that is !Send.
-                //
-                // This is usually safe because we only poll it on the main thread.
-                // However if the send fails, we know that:
-                // 1. main_receiver has been dropped (which implies the app is shutting down)
-                // 2. we are on a background thread.
-                // It is not safe to drop something !Send on the wrong thread, and
-                // the app will exit soon anyway, so we must forget the runnable.
-                //
-                // An embedded platform's thread is the host's, which lives on and may
-                // start GPUI again: its reaper drops the runnable there instead.
-                match self.reaper {
-                    Some(reaper) => {
-                        let runnable = runnable.0.into_raw().as_ptr();
-                        // If the post fails, the thread is gone, and the runnable leaks.
-                        unsafe {
-                            PostMessageW(
-                                Some(reaper.as_raw()),
-                                WM_GPUI_DROP_RUNNABLE,
-                                WPARAM(0),
-                                LPARAM(runnable as isize),
-                            )
-                            .log_err();
-                        }
-                    }
-                    None => std::mem::forget(runnable),
-                }
+                drop(open);
+                self.reap(runnable.0);
             }
         }
     }
@@ -222,17 +250,28 @@ unsafe extern "system" fn run_timer_callback(
     unsafe { CloseThreadpoolTimer(timer) };
 }
 
+/// A thread's reaper (see [`reaper`]): its window, and a number no other reaper has.
+#[derive(Clone, Copy)]
+pub(crate) struct Reaper {
+    window: SafeHwnd,
+    generation: usize,
+}
+
 /// This thread's reaper: a message-only window that drops the runnables woken for an embedded
 /// platform after it ended (a timer that fired late, say), on this thread, where their `!Send`
 /// futures belong. Created once per thread, it stays for the thread's life; the embedded
 /// platform's module is pinned, so its window procedure does too.
-pub(crate) fn reaper_window() -> anyhow::Result<SafeHwnd> {
+pub(crate) fn reaper() -> anyhow::Result<Reaper> {
     const CLASS_NAME: PCWSTR = w!("Zed::Reaper");
+    static GENERATIONS: AtomicUsize = AtomicUsize::new(1);
     thread_local! {
-        static REAPER: Cell<Option<SafeHwnd>> = const { Cell::new(None) };
+        static REAPER: Cell<Option<Reaper>> = const { Cell::new(None) };
     }
     if let Some(reaper) = REAPER.get() {
         return Ok(reaper);
+    }
+    if reaper_message() == 0 {
+        anyhow::bail!("registering the reaper's message failed");
     }
     // Registered for this module, like the platform's window class.
     let class = WNDCLASSW {
@@ -242,7 +281,7 @@ pub(crate) fn reaper_window() -> anyhow::Result<SafeHwnd> {
         ..Default::default()
     };
     unsafe { RegisterClassW(&class) };
-    let reaper: SafeHwnd = unsafe {
+    let window: SafeHwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS_NAME,
@@ -260,8 +299,23 @@ pub(crate) fn reaper_window() -> anyhow::Result<SafeHwnd> {
     }
     .context("creating the reaper window")?
     .into();
+    let generation = GENERATIONS.fetch_add(1, Ordering::Relaxed);
+    unsafe { set_window_long(window.as_raw(), GWLP_USERDATA, generation as isize) };
+    let reaper = Reaper { window, generation };
     REAPER.set(Some(reaper));
     Ok(reaper)
+}
+
+/// The reaper's message (0 if registering failed). Its name is unique to this module, which
+/// is pinned, so other windows, including other modules' reapers, ignore it. First called on
+/// the reaper's thread, so no thread pool thread registers it.
+fn reaper_message() -> u32 {
+    static MESSAGE: OnceLock<u32> = OnceLock::new();
+    *MESSAGE.get_or_init(|| {
+        let name = format!("GPUI reaper {:x}", get_module_handle().0 as usize);
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        unsafe { RegisterWindowMessageW(PCWSTR(name.as_ptr())) }
+    })
 }
 
 unsafe extern "system" fn reaper_procedure(
@@ -270,12 +324,17 @@ unsafe extern "system" fn reaper_procedure(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if msg == WM_GPUI_DROP_RUNNABLE {
-        // The dispatcher posted a runnable's raw pointer (`into_raw`) to this window, once.
-        let runnable =
-            unsafe { RunnableVariant::from_raw(NonNull::new_unchecked(lparam.0 as *mut ())) };
-        // Dropping it cancels its task and drops its future here.
-        crate::guard_callback(|| (), || drop(runnable));
+    if msg != 0 && msg == reaper_message() {
+        // `WindowsDispatcher::reap` posted a runnable's raw pointer (`into_raw`), once, to the
+        // reaper with this generation, on the runnable's thread. A window that took over a
+        // recycled handle (another thread's reaper) leaves it alone: it leaks, since dropping
+        // it on the wrong thread would abort.
+        if wparam.0 == unsafe { get_window_long(hwnd, GWLP_USERDATA) } as usize {
+            let runnable =
+                unsafe { RunnableVariant::from_raw(NonNull::new_unchecked(lparam.0 as *mut ())) };
+            // Cancels its task and drops its future here.
+            drop(runnable);
+        }
         return LRESULT(0);
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
