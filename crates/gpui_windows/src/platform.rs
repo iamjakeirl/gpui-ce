@@ -396,6 +396,7 @@ impl WindowsPlatform {
                             validation_number,
                             &all_windows,
                             &text_system,
+                            &stop_thread,
                         ) {
                             panic!("Device lost: {err}");
                         }
@@ -1578,7 +1579,11 @@ fn handle_gpu_device_lost(
     validation_number: usize,
     all_windows: &std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
     text_system: &std::sync::Weak<DirectWriteTextSystem>,
+    stop: &AtomicBool,
 ) -> Result<()> {
+    // Once the platform is ending, its windows' handles may be destroyed and reused: stop
+    // sending to them.
+    let stopped = || stop.load(Ordering::Acquire);
     // Here we wait a bit to ensure the system has time to recover from the device lost state.
     // If we don't wait, the final drawing result will be blank.
     std::thread::sleep(std::time::Duration::from_millis(350));
@@ -1589,6 +1594,9 @@ fn handle_gpu_device_lost(
     log::info!("DirectX devices successfully recreated.");
 
     let lparam = LPARAM(directx_devices as *const _ as _);
+    if stopped() {
+        return Ok(());
+    }
     unsafe {
         SendMessageW(
             platform_window,
@@ -1612,6 +1620,9 @@ fn handle_gpu_device_lost(
     };
     if let Some(all_windows) = all_windows.upgrade() {
         for window in windows(&all_windows).iter() {
+            if stopped() {
+                return Ok(());
+            }
             unsafe {
                 SendMessageW(
                     window.as_raw(),
@@ -1623,6 +1634,9 @@ fn handle_gpu_device_lost(
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
         for window in windows(&all_windows).iter() {
+            if stopped() {
+                return Ok(());
+            }
             unsafe {
                 SendMessageW(
                     window.as_raw(),

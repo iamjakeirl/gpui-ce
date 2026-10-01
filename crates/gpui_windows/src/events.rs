@@ -173,8 +173,14 @@ impl WindowsWindowInner {
             WM_INPUTLANGCHANGE => self.handle_input_language_changed(),
             WM_SHOWWINDOW => self.handle_window_visibility_changed(handle, wparam),
             WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
-            WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
-            WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
+            // Only from this window's own platform: a late message from a platform that has
+            // ended can reach a new window that was given the same handle.
+            WM_GPUI_FORCE_UPDATE_WINDOW if wparam.0 == self.validation_number => {
+                self.draw_window(handle, true)
+            }
+            WM_GPUI_GPU_DEVICE_LOST if wparam.0 == self.validation_number => {
+                self.handle_device_lost(lparam)
+            }
             DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
             _ => None,
