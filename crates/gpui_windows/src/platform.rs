@@ -147,8 +147,16 @@ impl WindowsPlatform {
         }
         let mut main_receiver = self.inner.main_receiver.clone();
         for _ in 0..1000 {
+            // A task that panicked (here, or in a window procedure it called) poisoned the
+            // platform: run no more.
+            if self.is_poisoned() {
+                return;
+            }
             match main_receiver.try_pop() {
-                Ok(Some(runnable)) => WindowsDispatcher::execute_runnable(runnable),
+                Ok(Some(runnable)) => guard_callback(
+                    || poison(&self.inner.state.poisoned, &self.inner.raw_window_handles),
+                    || WindowsDispatcher::execute_runnable(runnable),
+                ),
                 _ => break,
             }
         }
@@ -1228,6 +1236,9 @@ impl WindowsPlatformInner {
                     }
                     break 'tasks;
                 }
+                if self.state.poisoned.get() {
+                    break 'tasks;
+                }
                 let mut main_receiver = self.main_receiver.clone();
                 match main_receiver.try_pop() {
                     Ok(Some(runnable)) => WindowsDispatcher::execute_runnable(runnable),
@@ -1298,6 +1309,17 @@ impl WindowsPlatformInner {
 
 impl Drop for WindowsPlatform {
     fn drop(&mut self) {
+        // Drop the tasks still queued without running them: they may hold windows' state,
+        // which holds the queue, and nothing will run them now.
+        let mut main_receiver = self.inner.main_receiver.clone();
+        guard_callback(
+            || (),
+            || {
+                while let Ok(Some(runnable)) = main_receiver.try_pop() {
+                    drop(runnable);
+                }
+            },
+        );
         if let Some((stop, thread)) = self.vsync_thread.get_mut().take() {
             stop.store(true, Ordering::Release);
             // It ends within a frame. If it doesn't, it is recovering from a lost GPU device

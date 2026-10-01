@@ -467,12 +467,13 @@ impl WindowsWindow {
             poisoned,
         } = creation_info;
         register_window_class(icon);
-        let child_parent = match &params.kind {
-            WindowKind::Child(rwh::RawWindowHandle::Win32(parent)) => {
-                Some(HWND(parent.hwnd.get() as _))
-            }
+        let (child_parent, child_scale) = match &params.kind {
+            WindowKind::Child(ChildWindow {
+                parent: rwh::RawWindowHandle::Win32(parent),
+                scale_factor,
+            }) => (Some(HWND(parent.hwnd.get() as _)), *scale_factor),
             WindowKind::Child(_) => anyhow::bail!("a child window's parent must be a Win32 window"),
-            _ => None,
+            _ => (None, None),
         };
         let is_child = child_parent.is_some();
         let parent_hwnd = if params.kind == WindowKind::Dialog {
@@ -608,6 +609,21 @@ impl WindowsWindow {
         if is_child {
             // The parent places and shows it; no placement, frame or taskbar state of its own.
             this.state.border_offset.update(hwnd)?;
+            // The embedder's scale, before GPUI draws the first frame.
+            if let Some(scale_factor) = child_scale {
+                this.fixed_scale.set(true);
+                this.state.scale_factor.set(scale_factor);
+                this.state
+                    .direct_manipulation
+                    .set_scale_factor(scale_factor);
+                let mut rect = RECT::default();
+                unsafe { GetClientRect(hwnd, &mut rect) }?;
+                let device_size = size(
+                    DevicePixels(rect.right - rect.left),
+                    DevicePixels(rect.bottom - rect.top),
+                );
+                this.handle_size_change(device_size, scale_factor, false);
+            }
             return Ok(Self(this));
         }
         set_non_rude_hwnd(hwnd, true);
@@ -650,6 +666,11 @@ impl rwh::HasDisplayHandle for WindowsWindow {
 
 impl Drop for WindowsWindow {
     fn drop(&mut self) {
+        // Nothing to destroy, or no task will ever run: queueing one would only keep this
+        // window's state alive through the queue.
+        if self.0.destroyed.get() || self.0.poisoned.get() {
+            return;
+        }
         // clone this `Rc` to prevent early release of the pointer
         let this = self.0.clone();
         self.0
@@ -1278,9 +1299,12 @@ struct WindowsDragDropHandler(pub Rc<WindowsWindowInner>);
 
 impl WindowsDragDropHandler {
     fn handle_drag_drop(&self, input: PlatformInput) {
+        if self.0.poisoned.get() {
+            return;
+        }
         // OLE calls these methods directly, outside any window procedure's guard.
         guard_callback(
-            || (),
+            || poison(&self.0.poisoned, &self.0.raw_window_handles),
             || {
                 if let Some(mut func) = self.0.state.callbacks.input.take() {
                     func(input);

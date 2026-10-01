@@ -2369,8 +2369,22 @@ pub enum WindowKind {
     /// ([`WindowOptions::window_bounds`] is ignored); the embedder resizes it with the parent
     /// ([`Window::resize`](crate::Window::resize)), and destroying the parent destroys it.
     #[cfg(target_os = "windows")]
-    Child(raw_window_handle::RawWindowHandle),
+    Child(ChildWindow),
 }
+
+/// Where a [`WindowKind::Child`] window goes, and at what scale it draws.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChildWindow {
+    /// The window it goes in.
+    pub parent: raw_window_handle::RawWindowHandle,
+    /// The scale factor to draw at, from the first frame, instead of the display's. The
+    /// embedder can change it later with [`Window::set_scale_factor`](crate::Window::set_scale_factor).
+    pub scale_factor: Option<f32>,
+}
+
+#[cfg(target_os = "windows")]
+impl Eq for ChildWindow {}
 
 /// The appearance of the window, as defined by the operating system.
 ///
