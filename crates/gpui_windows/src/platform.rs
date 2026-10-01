@@ -292,6 +292,7 @@ impl WindowsPlatform {
             invalidate_devices: self.invalidate_devices.clone(),
             draw_coordinator: self.inner.state.draw_coordinator.clone(),
             embedded: self.embedded,
+            raw_window_handles: Arc::downgrade(&self.raw_window_handles),
         }
     }
 
@@ -1272,16 +1273,17 @@ impl Drop for WindowsPlatform {
     fn drop(&mut self) {
         if let Some((stop, thread)) = self.vsync_thread.get_mut().take() {
             stop.store(true, Ordering::Release);
-            // The thread may be sending this thread a message (GPU device recovery): deliver
-            // sent messages while waiting, or both would wait for ever.
-            while !thread.is_finished() {
-                let mut msg = MSG::default();
-                unsafe {
-                    let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
-                }
+            // It ends within a frame. If it doesn't, it is recovering from a lost GPU device
+            // and sending this thread a message: rather than wait for each other, or deliver
+            // the host's sent messages here, let it finish on its own. It holds no window or
+            // platform state that outlives this drop, and the module stays loaded.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            while !thread.is_finished() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            thread.join().ok();
+            if thread.is_finished() {
+                thread.join().ok();
+            }
         }
         unsafe {
             if let Some(notification) = self.suspend_resume_notification.borrow_mut().take() {
@@ -1315,6 +1317,8 @@ pub(crate) struct WindowCreationInfo {
     /// Shared with [`WindowsPlatformState::draw_coordinator`] and every other window.
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
     pub(crate) embedded: bool,
+    /// The platform's list of window handles, which a window leaves as it's destroyed.
+    pub(crate) raw_window_handles: std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
 }
 
 /// Keeps the module holding this code loaded until the process ends.
@@ -1597,8 +1601,13 @@ fn handle_gpu_device_lost(
     if let Some(text_system) = text_system.upgrade() {
         text_system.handle_gpu_lost(&directx_devices)?;
     }
+    // Copy the handles out: the UI thread takes the list's write lock as a window is destroyed,
+    // so holding the read lock across a send to it could deadlock.
+    let windows = |all_windows: &RwLock<SmallVec<[SafeHwnd; 4]>>| {
+        all_windows.read().iter().copied().collect::<SmallVec<[SafeHwnd; 4]>>()
+    };
     if let Some(all_windows) = all_windows.upgrade() {
-        for window in all_windows.read().iter() {
+        for window in windows(&all_windows).iter() {
             unsafe {
                 SendMessageW(
                     window.as_raw(),
@@ -1609,7 +1618,7 @@ fn handle_gpu_device_lost(
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
-        for window in all_windows.read().iter() {
+        for window in windows(&all_windows).iter() {
             unsafe {
                 SendMessageW(
                     window.as_raw(),

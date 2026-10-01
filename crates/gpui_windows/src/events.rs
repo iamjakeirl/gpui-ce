@@ -371,14 +371,12 @@ impl WindowsWindowInner {
         if let Some(callback) = callback {
             callback();
         }
-        // Forget the handle now, not later: once destroyed, Windows may reuse it.
-        unsafe {
-            SendMessageW(
-                self.platform_window_handle,
-                WM_GPUI_CLOSE_ONE_WINDOW,
-                Some(WPARAM(self.validation_number)),
-                Some(LPARAM(handle.0 as isize)),
-            );
+        // Leave the platform's list now, not later: once destroyed, Windows may reuse the
+        // handle. (The platform may be gone already.)
+        if let Some(all_windows) = self.raw_window_handles.upgrade() {
+            all_windows
+                .write()
+                .retain(|window| window.as_raw() != handle);
         }
         Some(0)
     }

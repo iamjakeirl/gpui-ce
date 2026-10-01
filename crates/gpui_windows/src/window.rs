@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use parking_lot::RwLock;
 use futures::channel::oneshot::{self, Receiver};
 use gpui_util::ResultExt;
 use raw_window_handle as rwh;
@@ -112,6 +113,8 @@ pub(crate) struct WindowsWindowInner {
     /// Windows has destroyed `hwnd` (`WM_DESTROY` arrived), perhaps with its parent: queued
     /// work must not use the handle, which Windows may give to another window.
     pub(crate) destroyed: Cell<bool>,
+    /// The platform's list of window handles, which this window leaves as it's destroyed.
+    pub(crate) raw_window_handles: std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
 }
 
 impl WindowsWindowState {
@@ -288,6 +291,7 @@ impl WindowsWindowInner {
             is_child: context.is_child,
             embedded: context.embedded,
             destroyed: Cell::new(false),
+            raw_window_handles: context.raw_window_handles.clone(),
         }))
     }
 
@@ -422,6 +426,7 @@ struct WindowCreateContext {
     parent_hwnd: Option<HWND>,
     is_child: bool,
     embedded: bool,
+    raw_window_handles: std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
 }
 
 impl WindowsWindow {
@@ -450,6 +455,7 @@ impl WindowsWindow {
             invalidate_devices,
             draw_coordinator,
             embedded,
+            raw_window_handles,
         } = creation_info;
         register_window_class(icon);
         let child_parent = match &params.kind {
@@ -553,6 +559,7 @@ impl WindowsWindow {
             parent_hwnd,
             is_child,
             embedded,
+            raw_window_handles,
         };
         // A child starts out filling its parent's client area.
         let (x, y, cx, cy) = match child_parent {
