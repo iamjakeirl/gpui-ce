@@ -224,6 +224,11 @@ impl WindowsPlatform {
             directx_devices,
             dispatcher: None,
             embedded,
+            reaper: if embedded {
+                Some(reaper_window()?)
+            } else {
+                None
+            },
         };
         let result = unsafe {
             CreateWindowExW(
@@ -1428,6 +1433,7 @@ struct PlatformWindowCreateContext {
     directx_devices: Option<DirectXDevices>,
     dispatcher: Option<Arc<WindowsDispatcher>>,
     embedded: bool,
+    reaper: Option<SafeHwnd>,
 }
 
 fn has_package_identity() -> bool {
@@ -1752,6 +1758,7 @@ unsafe extern "system" fn window_procedure(
             main_sender,
             hwnd,
             creation_context.validation_number,
+            creation_context.reaper,
         )));
 
         return match guard_callback(
