@@ -1604,7 +1604,11 @@ fn handle_gpu_device_lost(
     // Copy the handles out: the UI thread takes the list's write lock as a window is destroyed,
     // so holding the read lock across a send to it could deadlock.
     let windows = |all_windows: &RwLock<SmallVec<[SafeHwnd; 4]>>| {
-        all_windows.read().iter().copied().collect::<SmallVec<[SafeHwnd; 4]>>()
+        all_windows
+            .read()
+            .iter()
+            .copied()
+            .collect::<SmallVec<[SafeHwnd; 4]>>()
     };
     if let Some(all_windows) = all_windows.upgrade() {
         for window in windows(&all_windows).iter() {
