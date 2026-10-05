@@ -540,6 +540,7 @@ impl WindowsWindowInner {
         {
             // Posting happens only after the callback has returned and released its borrows.
             if bridge.requested.replace(false)
+                && !bridge.closed.get()
                 && fresh
                 && self.post_host_space(bridge, msg, wparam, lparam)
             {
@@ -682,6 +683,51 @@ impl WindowsWindowInner {
                         key,
                         Self::host_release(down),
                     );
+                }
+            }
+        }
+    }
+    pub(crate) fn close_host_keys(&self, synchronous: bool) {
+        let snapshot = {
+            let bridge = self.host_space.borrow();
+            let Some(bridge) = bridge.as_ref() else {
+                return;
+            };
+            if bridge.closed.replace(true) {
+                return;
+            }
+            let snapshot = bridge.clone();
+            for press in &bridge.press {
+                if matches!(press.get(), Some(SpacePress::Host(..))) {
+                    press.set(Some(SpacePress::Released));
+                }
+            }
+            snapshot
+        };
+        // Ownership is retired and the RefCell guard is gone before any callout.
+        for press in &snapshot.press {
+            if let Some(SpacePress::Host(msg, key, down)) = press.get() {
+                if !self.valid_host_space(&snapshot) {
+                    break;
+                }
+                let (msg, up) = (Self::host_keyup(msg), Self::host_release(down));
+                // SAFETY: pinned ancestry rechecked per send; caller retains the native
+                // Rc without GPUI/bridge borrows across arbitrary host reentry.
+                unsafe {
+                    if synchronous {
+                        SendMessageW(snapshot.target, msg, Some(key), Some(up));
+                    } else {
+                        // Borrowed GPUI: root posting is best effort (possibly the dying
+                        // target itself); Live acceptance remains unverified.
+                        let root = GetAncestor(snapshot.target, GA_ROOTOWNER);
+                        let mut process = 0;
+                        if GetWindowThreadProcessId(root, Some(&mut process))
+                            == GetCurrentThreadId()
+                            && process == GetCurrentProcessId()
+                        {
+                            let _ = PostMessageW(Some(root), msg, key, up);
+                        }
+                    }
                 }
             }
         }

@@ -124,12 +124,14 @@ pub(crate) struct WindowsWindowInner {
 }
 
 /// Fixed native-key ownership survives changes to canvas text/control focus.
+#[derive(Clone)]
 pub(crate) struct HostSpace {
     pub(crate) shell: HWND,
     pub(crate) target: HWND,
     pub(crate) requested: Rc<Cell<bool>>,
     pub(crate) press: [Cell<Option<SpacePress>>; HOST_SPACE_KEYS.len()],
     pub(crate) chars: Cell<Option<(u32, isize)>>,
+    pub(crate) closed: Cell<bool>,
 }
 pub(crate) const HOST_SPACE_KEYS: &[u8] = b" ASDFGHJKWETYUZXCV";
 #[derive(Clone, Copy)]

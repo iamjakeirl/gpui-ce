@@ -169,6 +169,7 @@ impl WindowsPlatform {
             requested: requested.clone(),
             press: std::array::from_fn(|_| Cell::new(None)),
             chars: Cell::new(None),
+            closed: Cell::new(false),
         };
         anyhow::ensure!(
             inner.valid_host_space(&bridge),
@@ -176,6 +177,22 @@ impl WindowsPlatform {
         );
         *inner.host_space.borrow_mut() = Some(bridge);
         Ok(requested)
+    }
+    /// Retire held host keys. Set `synchronous` only outside GPUI App/entity borrows:
+    /// key-up can run arbitrary host code. Otherwise post releases to GA_ROOTOWNER.
+    pub fn close_host_keys(&self, shell: raw_window_handle::RawWindowHandle, synchronous: bool) {
+        let raw_window_handle::RawWindowHandle::Win32(shell) = shell else {
+            return;
+        };
+        let shell = HWND(shell.hwnd.get() as *mut _);
+        let handles = self.raw_window_handles.read().clone();
+        let window = handles
+            .iter()
+            .filter_map(|hwnd| window_from_hwnd(**hwnd))
+            .find(|inner| inner.is_child && inner.parent_hwnd == Some(shell));
+        if let Some(window) = window {
+            window.close_host_keys(synchronous);
+        }
     }
 
     /// Runs the queued foreground tasks now, without the usual time budget (at most a
