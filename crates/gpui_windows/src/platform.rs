@@ -189,7 +189,7 @@ impl WindowsPlatform {
         let window = handles
             .iter()
             .filter_map(|hwnd| window_from_hwnd(**hwnd))
-            .find(|inner| inner.is_child && inner.parent_hwnd == Some(shell));
+            .find(|inner| inner.host_space.borrow().as_ref().map(|b| b.shell) == Some(shell));
         if let Some(window) = window {
             window.close_host_keys(synchronous);
         }
