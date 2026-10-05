@@ -776,7 +776,7 @@ impl Platform for WindowsPlatform {
         let window = self.find_current_active_window();
         self.foreground_executor()
             .spawn(async move {
-                let _ = tx.send(file_open_dialog(options, window));
+                run_file_open_prompt(tx, || file_open_dialog(options, window));
             })
             .detach();
 
@@ -1592,6 +1592,27 @@ fn open_target_in_explorer(target: &Path) -> Result<()> {
     })
 }
 
+fn run_file_open_prompt(
+    tx: oneshot::Sender<Result<Option<Vec<PathBuf>>>>,
+    open_dialog: impl FnOnce() -> Result<Option<Vec<PathBuf>>>,
+) {
+    // This suppresses queued prompts; it cannot cancel a dialog already in Show.
+    if tx.is_canceled() {
+        return;
+    }
+    let _ = tx.send(open_dialog());
+}
+
+fn file_open_dialog_accepted(
+    show_result: windows::core::Result<()>,
+) -> windows::core::Result<bool> {
+    match show_result {
+        Ok(()) => Ok(true),
+        Err(err) if err.code() == HRESULT::from_win32(ERROR_CANCELLED.0) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 fn file_open_dialog(
     options: PathPromptOptions,
     window: Option<HWND>,
@@ -1615,8 +1636,7 @@ fn file_open_dialog(
             folder_dialog.SetOkButtonLabel(&HSTRING::from(prompt))?;
         }
 
-        if folder_dialog.Show(window).is_err() {
-            // User cancelled
+        if !file_open_dialog_accepted(folder_dialog.Show(window))? {
             return Ok(None);
         }
     }
@@ -1896,7 +1916,49 @@ mod tests {
     use crate::{read_from_clipboard, write_to_clipboard};
     use gpui::ClipboardItem;
 
-    use super::encode_restart_arguments;
+    use super::{encode_restart_arguments, file_open_dialog_accepted, run_file_open_prompt};
+
+    #[test]
+    fn test_file_open_prompt_skips_dropped_receiver() {
+        let calls = std::cell::Cell::new(0);
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let queued_prompt = async {
+            run_file_open_prompt(tx, || {
+                calls.set(calls.get() + 1);
+                Ok(None)
+            });
+        };
+        drop(rx);
+        futures::executor::block_on(queued_prompt);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn test_file_open_prompt_delivers_result() {
+        let calls = std::cell::Cell::new(0);
+        let (tx, mut rx) = futures::channel::oneshot::channel();
+        let paths = vec![std::path::PathBuf::from(r"C:\graph.nmgraph")];
+        run_file_open_prompt(tx, || {
+            calls.set(calls.get() + 1);
+            Ok(Some(paths.clone()))
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(rx.try_recv().unwrap().unwrap().unwrap(), Some(paths));
+    }
+
+    #[test]
+    fn test_file_open_dialog_show_result() {
+        use windows::{
+            Win32::Foundation::{E_FAIL, ERROR_CANCELLED},
+            core::{Error, HRESULT},
+        };
+
+        assert!(file_open_dialog_accepted(Ok(())).unwrap());
+        let cancel = HRESULT::from_win32(ERROR_CANCELLED.0);
+        assert!(!file_open_dialog_accepted(Err(Error::from_hresult(cancel))).unwrap());
+        let failure = file_open_dialog_accepted(Err(Error::from_hresult(E_FAIL))).unwrap_err();
+        assert_eq!(failure.code(), E_FAIL);
+    }
 
     #[test]
     fn test_encode_restart_arguments() {
