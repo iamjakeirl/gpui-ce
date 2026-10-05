@@ -137,6 +137,46 @@ impl WindowsPlatform {
         Self::new_with_mode(false, true)
     }
 
+    /// Enables Space routing for one embedded child of the supplied shell window.
+    /// The shell's immediate parent is the editor parent supplied by the host. The
+    /// returned flag is set only by the canvas's non-text Space capture listener.
+    pub fn enable_host_space(
+        &self,
+        window: AnyWindowHandle,
+        shell: raw_window_handle::RawWindowHandle,
+    ) -> Result<Rc<Cell<bool>>> {
+        anyhow::ensure!(
+            self.embedded && !self.is_poisoned(),
+            "not a live embedded platform"
+        );
+        let raw_window_handle::RawWindowHandle::Win32(shell) = shell else {
+            anyhow::bail!("host Space needs a Win32 shell");
+        };
+        let shell = HWND(shell.hwnd.get() as *mut _);
+        // Only dereference userdata of this platform's tracked, live windows.
+        let handles = self.raw_window_handles.read().clone();
+        let inner = handles
+            .iter()
+            .filter_map(|hwnd| window_from_hwnd(**hwnd))
+            .find(|inner| inner.handle == window && inner.is_child && !inner.destroyed.get())
+            .ok_or_else(|| anyhow::anyhow!("embedded Space window is gone"))?;
+        // SAFETY: query-only ancestry lookup; neither handle is dereferenced by Rust.
+        let target = unsafe { GetParent(shell) }?;
+        let requested = Rc::new(Cell::new(false));
+        let bridge = HostSpace {
+            shell,
+            target,
+            requested: requested.clone(),
+            press: Cell::new(None),
+        };
+        anyhow::ensure!(
+            inner.valid_host_space(&bridge),
+            "host Space ancestry/thread mismatch"
+        );
+        *inner.host_space.borrow_mut() = Some(bridge);
+        Ok(requested)
+    }
+
     /// Runs the queued foreground tasks now, without the usual time budget (at most a
     /// thousand, so a task that keeps queueing itself can't hold the host). An embedder calls
     /// it after closing a window, so the window is destroyed before control returns to the

@@ -6,7 +6,10 @@ use windows::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
-        System::SystemServices::*,
+        System::{
+            SystemServices::*,
+            Threading::{GetCurrentProcessId, GetCurrentThreadId},
+        },
         UI::{
             Controls::*,
             HiDpi::*,
@@ -149,6 +152,11 @@ impl WindowsWindowInner {
             }
             WM_MOUSEWHEEL => self.handle_mouse_wheel_msg(handle, wparam, lparam),
             WM_MOUSEHWHEEL => self.handle_mouse_horizontal_wheel_msg(handle, wparam, lparam),
+            WM_KEYUP | WM_SYSKEYUP
+                if wparam.0 == VK_SPACE.0 as usize && self.release_host_space(msg, lparam) =>
+            {
+                Some(0)
+            }
             WM_SYSKEYUP if self.embedded => {
                 // Report it, then let the host see it too: Alt and F10 open its menus.
                 self.handle_syskeyup_msg(wparam, lparam);
@@ -161,6 +169,9 @@ impl WindowsWindowInner {
                 self.handle_embedded_keydown_msg(handle, msg, wparam, lparam)
             }
             WM_SETFOCUS | WM_KILLFOCUS if self.is_child => {
+                if msg == WM_KILLFOCUS {
+                    self.end_host_space();
+                }
                 // A child is never activated; its keyboard focus stands for it.
                 self.handle_activate_msg(WPARAM((msg == WM_SETFOCUS) as usize))
             }
@@ -365,6 +376,7 @@ impl WindowsWindowInner {
     /// What `WM_DESTROY` must do even when no GPUI code may run: revoke drag and drop and
     /// forget the handle, which Windows may reuse once the window is gone.
     pub(crate) fn forget_destroyed_window(&self, handle: HWND) {
+        self.end_host_space();
         self.destroyed.set(true);
         unsafe { windows::Win32::System::Ole::RevokeDragDrop(handle) }.log_err();
         if let Some(all_windows) = self.raw_window_handles.upgrade() {
@@ -493,7 +505,46 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<isize> {
-        let result = self.handle_keydown_msg(wparam, lparam);
+        let is_space = wparam.0 == VK_SPACE.0 as usize && self.host_space.borrow().is_some();
+        if is_space
+            && lparam.0 & (1 << 30) == 0
+            && let Some(bridge) = self.host_space.borrow().as_ref()
+            && matches!(
+                bridge.press.get(),
+                Some(SpacePress::Local | SpacePress::Released)
+            )
+        {
+            bridge.press.set(None);
+        }
+        let owned = is_space
+            && self
+                .host_space
+                .borrow()
+                .as_ref()
+                .is_some_and(|b| !matches!(b.press.get(), None | Some(SpacePress::Local)));
+        if is_space && let Some(bridge) = self.host_space.borrow().as_ref() {
+            bridge.requested.set(false);
+        }
+        // Host repeats stay consumed: Space triggers transport once per physical press.
+        let mut result = if owned {
+            Some(0)
+        } else {
+            self.handle_keydown_msg(wparam, lparam)
+        };
+        if is_space
+            && !owned
+            && let Some(bridge) = self.host_space.borrow().as_ref()
+        {
+            if bridge.press.get().is_none() {
+                let forward = bridge.requested.replace(false) && lparam.0 & (1 << 30) == 0;
+                if forward && self.post_host_space(bridge, msg, lparam) {
+                    bridge.press.set(Some(SpacePress::Host(msg, lparam)));
+                    result = Some(0);
+                } else {
+                    bridge.press.set(Some(SpacePress::Local));
+                }
+            }
+        }
         if result == Some(0) {
             let (first, last) = if msg == WM_SYSKEYDOWN {
                 (WM_SYSCHAR, WM_SYSDEADCHAR)
@@ -515,6 +566,75 @@ impl WindowsWindowInner {
         }
         // An unhandled system key (Alt combinations, F10) goes on to the host's menus.
         if msg == WM_SYSKEYDOWN { None } else { result }
+    }
+
+    pub(crate) fn valid_host_space(&self, bridge: &HostSpace) -> bool {
+        // SAFETY: query-only HWND APIs; the live child pins this exact ancestry on
+        // its UI thread. Destroying either ancestor destroys the child as well.
+        unsafe {
+            let mut process = 0;
+            let thread = GetCurrentThreadId();
+            !self.destroyed.get()
+                && GetParent(self.state.hwnd).ok() == Some(bridge.shell)
+                && GetParent(bridge.shell).ok() == Some(bridge.target)
+                && [self.state.hwnd, bridge.shell, bridge.target]
+                    .iter()
+                    .all(|hwnd| {
+                        GetWindowThreadProcessId(*hwnd, Some(&mut process)) == thread
+                            && process == GetCurrentProcessId()
+                    })
+        }
+    }
+
+    fn post_host_space(&self, bridge: &HostSpace, msg: u32, lparam: LPARAM) -> bool {
+        if !self.valid_host_space(bridge) {
+            return false;
+        }
+        // SAFETY: same-process/thread ancestry was checked without any callout;
+        // posting scalar key data does not synchronously reenter GPUI or the host.
+        unsafe {
+            PostMessageW(
+                Some(bridge.target),
+                msg,
+                WPARAM(VK_SPACE.0 as usize),
+                lparam,
+            )
+        }
+        .is_ok()
+    }
+
+    fn release_host_space(&self, msg: u32, lparam: LPARAM) -> bool {
+        let bridge = self.host_space.borrow();
+        let Some(bridge) = bridge.as_ref() else {
+            return false;
+        };
+        match bridge.press.take() {
+            Some(SpacePress::Host(_, _)) => {
+                self.post_host_space(bridge, msg, lparam);
+                true
+            }
+            Some(SpacePress::Released) => true,
+            _ => false,
+        }
+    }
+
+    fn end_host_space(&self) {
+        let bridge = self.host_space.borrow();
+        if let Some(bridge) = bridge.as_ref()
+            && let Some(SpacePress::Host(msg, down)) = bridge.press.get()
+        {
+            bridge.press.set(Some(SpacePress::Released));
+            // Scan/extended bits survive; one matching release, previous-down + transition.
+            self.post_host_space(
+                bridge,
+                if msg == WM_SYSKEYDOWN {
+                    WM_SYSKEYUP
+                } else {
+                    WM_KEYUP
+                },
+                LPARAM((down.0 & 0x21ff0000) | 0xc0000001),
+            );
+        }
     }
 
     /// A child gets no `WM_DPICHANGED`; it reads its new scale when its parent's changes,

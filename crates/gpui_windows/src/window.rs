@@ -87,7 +87,7 @@ pub struct WindowsWindowState {
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
     fullscreen: Cell<Option<StyleAndBounds>>,
     initial_placement: Cell<Option<WindowOpenStatus>>,
-    hwnd: HWND,
+    pub(crate) hwnd: HWND,
     pub(crate) a11y: RefCell<Option<A11yState>>,
 }
 
@@ -120,6 +120,21 @@ pub(crate) struct WindowsWindowInner {
     /// The embedder set the scale ([`PlatformWindow::set_scale_factor`]): DPI changes don't
     /// change it.
     pub(crate) fixed_scale: Cell<bool>,
+    pub(crate) host_space: RefCell<Option<HostSpace>>,
+}
+
+/// Space only; ownership survives changes to canvas text/control focus.
+pub(crate) struct HostSpace {
+    pub(crate) shell: HWND,
+    pub(crate) target: HWND,
+    pub(crate) requested: Rc<Cell<bool>>,
+    pub(crate) press: Cell<Option<SpacePress>>,
+}
+#[derive(Clone, Copy)]
+pub(crate) enum SpacePress {
+    Local,
+    Host(u32, LPARAM),
+    Released,
 }
 
 impl WindowsWindowState {
@@ -299,6 +314,7 @@ impl WindowsWindowInner {
             raw_window_handles: context.raw_window_handles.clone(),
             poisoned: context.poisoned.clone(),
             fixed_scale: Cell::new(false),
+            host_space: RefCell::new(None),
         }))
     }
 
