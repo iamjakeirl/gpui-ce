@@ -152,11 +152,7 @@ impl WindowsWindowInner {
             }
             WM_MOUSEWHEEL => self.handle_mouse_wheel_msg(handle, wparam, lparam),
             WM_MOUSEHWHEEL => self.handle_mouse_horizontal_wheel_msg(handle, wparam, lparam),
-            WM_KEYUP | WM_SYSKEYUP
-                if wparam.0 == VK_SPACE.0 as usize && self.release_host_space(msg, lparam) =>
-            {
-                Some(0)
-            }
+            WM_KEYUP | WM_SYSKEYUP if self.release_host_space(wparam, lparam) => Some(0),
             WM_SYSKEYUP if self.embedded => {
                 // Report it, then let the host see it too: Alt and F10 open its menus.
                 self.handle_syskeyup_msg(wparam, lparam);
@@ -176,6 +172,7 @@ impl WindowsWindowInner {
                 self.handle_activate_msg(WPARAM((msg == WM_SETFOCUS) as usize))
             }
             WM_DPICHANGED_AFTERPARENT if self.is_child => self.handle_child_dpi_changed_msg(handle),
+            WM_CHAR | WM_SYSCHAR if self.suppress_host_char(msg, lparam) => Some(0),
             WM_CHAR => self.handle_char_msg(wparam),
             WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
@@ -505,45 +502,70 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<isize> {
-        let is_space = wparam.0 == VK_SPACE.0 as usize && self.host_space.borrow().is_some();
-        if is_space
-            && lparam.0 & (1 << 30) == 0
-            && let Some(bridge) = self.host_space.borrow().as_ref()
-            && matches!(
-                bridge.press.get(),
-                Some(SpacePress::Local | SpacePress::Released)
-            )
-        {
-            bridge.press.set(None);
+        if let Some(bridge) = self.host_space.borrow().as_ref() {
+            bridge.chars.set(None);
         }
-        let owned = is_space
-            && self
-                .host_space
+        let slot = HOST_SPACE_KEYS
+            .iter()
+            .position(|key| usize::from(*key) == wparam.0);
+        let fresh = lparam.0 & (1 << 30) == 0;
+        if fresh
+            && let Some(slot) = slot
+            && let Some(bridge) = self.host_space.borrow().as_ref()
+        {
+            // A missed up must be balanced before this new physical press starts.
+            if let Some(SpacePress::Host(msg, key, down)) = bridge.press[slot].take() {
+                self.post_host_space(bridge, Self::host_keyup(msg), key, Self::host_release(down));
+            }
+        }
+        let owned = slot.is_some_and(|slot| {
+            self.host_space
                 .borrow()
                 .as_ref()
-                .is_some_and(|b| !matches!(b.press.get(), None | Some(SpacePress::Local)));
-        if is_space && let Some(bridge) = self.host_space.borrow().as_ref() {
+                .is_some_and(|b| !matches!(b.press[slot].get(), None | Some(SpacePress::Local)))
+        });
+        if let Some(bridge) = self.host_space.borrow().as_ref() {
             bridge.requested.set(false);
         }
-        // Host repeats stay consumed: Space triggers transport once per physical press.
+        // Host holds trigger once; late repeats after cleanup remain consumed.
         let mut result = if owned {
             Some(0)
         } else {
             self.handle_keydown_msg(wparam, lparam)
         };
-        if is_space
-            && !owned
+        if !owned
+            && let Some(slot) = slot
             && let Some(bridge) = self.host_space.borrow().as_ref()
+            && bridge.press[slot].get().is_none()
         {
-            if bridge.press.get().is_none() {
-                let forward = bridge.requested.replace(false) && lparam.0 & (1 << 30) == 0;
-                if forward && self.post_host_space(bridge, msg, lparam) {
-                    bridge.press.set(Some(SpacePress::Host(msg, lparam)));
-                    result = Some(0);
-                } else {
-                    bridge.press.set(Some(SpacePress::Local));
-                }
+            // Posting happens only after the callback has returned and released its borrows.
+            if bridge.requested.replace(false)
+                && fresh
+                && self.post_host_space(bridge, msg, wparam, lparam)
+            {
+                bridge.press[slot].set(Some(SpacePress::Host(msg, wparam, lparam)));
+                result = Some(0);
+            } else {
+                bridge.press[slot].set(Some(SpacePress::Local));
             }
+        }
+        if result == Some(0)
+            && let Some(slot) = slot
+            && let Some(bridge) = self.host_space.borrow().as_ref()
+            && !matches!(bridge.press[slot].get(), None | Some(SpacePress::Local))
+        {
+            // D-430: normal pumping delivers this scan's CHAR before the next down.
+            // A filtered pump can deliver posted Ctrl+S after Ctrl-up as bare S, and
+            // can wrongly drop/keep a pending character. This is not exact attribution.
+            bridge.chars.set(Some((
+                if msg == WM_SYSKEYDOWN {
+                    WM_SYSCHAR
+                } else {
+                    WM_CHAR
+                },
+                (lparam.0 >> 16) & 0x1ff,
+            )));
+            return result;
         }
         if result == Some(0) {
             let (first, last) = if msg == WM_SYSKEYDOWN {
@@ -551,21 +573,35 @@ impl WindowsWindowInner {
             } else {
                 (WM_CHAR, WM_DEADCHAR)
             };
-            // The key's character carries the key's scan code. Only it is dropped: characters
-            // queued before it belong to earlier keys.
+            // Preserve the existing local GPUI-consumed key behavior.
             let scan_code = |lparam: LPARAM| (lparam.0 >> 16) & 0x1ff;
             let mut pending = MSG::default();
-            unsafe {
-                if PeekMessageW(&mut pending, Some(handle), first, last, PM_NOREMOVE).as_bool()
-                    && scan_code(pending.lParam) == scan_code(lparam)
-                {
-                    let _ = PeekMessageW(&mut pending, Some(handle), first, last, PM_REMOVE);
-                }
+            // SAFETY: inspect this live child's character family into a local MSG.
+            let has_char = unsafe {
+                PeekMessageW(&mut pending, Some(handle), first, last, PM_NOREMOVE).as_bool()
+            };
+            if has_char && pending.hwnd == handle && scan_code(pending.lParam) == scan_code(lparam)
+            {
+                // SAFETY: retrieve from this same UI-thread/window character queue;
+                // no Rust pointer is retained. Filtered-pump attribution is limited above.
+                let _ = unsafe { PeekMessageW(&mut pending, Some(handle), first, last, PM_REMOVE) };
             }
             return result;
         }
         // An unhandled system key (Alt combinations, F10) goes on to the host's menus.
         if msg == WM_SYSKEYDOWN { None } else { result }
+    }
+
+    fn suppress_host_char(&self, msg: u32, lparam: LPARAM) -> bool {
+        let bridge = self.host_space.borrow();
+        let Some(bridge) = bridge.as_ref() else {
+            return false;
+        };
+        if bridge.chars.get() != Some((msg, (lparam.0 >> 16) & 0x1ff)) {
+            return false;
+        }
+        bridge.chars.set(None);
+        true
     }
 
     pub(crate) fn valid_host_space(&self, bridge: &HostSpace) -> bool {
@@ -586,54 +622,68 @@ impl WindowsWindowInner {
         }
     }
 
-    fn post_host_space(&self, bridge: &HostSpace, msg: u32, lparam: LPARAM) -> bool {
+    fn post_host_space(&self, bridge: &HostSpace, msg: u32, key: WPARAM, lparam: LPARAM) -> bool {
         if !self.valid_host_space(bridge) {
             return false;
         }
         // SAFETY: same-process/thread ancestry was checked without any callout;
         // posting scalar key data does not synchronously reenter GPUI or the host.
-        unsafe {
-            PostMessageW(
-                Some(bridge.target),
-                msg,
-                WPARAM(VK_SPACE.0 as usize),
-                lparam,
-            )
-        }
-        .is_ok()
+        unsafe { PostMessageW(Some(bridge.target), msg, key, lparam) }.is_ok()
     }
 
-    fn release_host_space(&self, msg: u32, lparam: LPARAM) -> bool {
+    fn host_keyup(msg: u32) -> u32 {
+        if msg == WM_SYSKEYDOWN {
+            WM_SYSKEYUP
+        } else {
+            WM_KEYUP
+        }
+    }
+
+    fn host_release(down: LPARAM) -> LPARAM {
+        // Original scan/extended/context bits; one previous-down + transition release.
+        LPARAM((down.0 & 0x21ff0000) | 0xc0000001)
+    }
+
+    fn release_host_space(&self, key: WPARAM, lparam: LPARAM) -> bool {
         let bridge = self.host_space.borrow();
         let Some(bridge) = bridge.as_ref() else {
             return false;
         };
-        match bridge.press.take() {
-            Some(SpacePress::Host(_, _)) => {
-                self.post_host_space(bridge, msg, lparam);
+        let Some(slot) = HOST_SPACE_KEYS
+            .iter()
+            .position(|vk| usize::from(*vk) == key.0)
+        else {
+            return false;
+        };
+        match bridge.press[slot].get() {
+            Some(SpacePress::Host(msg, key, down)) => {
+                bridge.press[slot].set(None);
+                let release = LPARAM((lparam.0 & !0x21ff0000) | (down.0 & 0x21ff0000));
+                self.post_host_space(bridge, Self::host_keyup(msg), key, release);
                 true
             }
             Some(SpacePress::Released) => true,
-            _ => false,
+            _ => {
+                bridge.press[slot].set(None);
+                false
+            }
         }
     }
 
     fn end_host_space(&self) {
         let bridge = self.host_space.borrow();
-        if let Some(bridge) = bridge.as_ref()
-            && let Some(SpacePress::Host(msg, down)) = bridge.press.get()
-        {
-            bridge.press.set(Some(SpacePress::Released));
-            // Scan/extended bits survive; one matching release, previous-down + transition.
-            self.post_host_space(
-                bridge,
-                if msg == WM_SYSKEYDOWN {
-                    WM_SYSKEYUP
-                } else {
-                    WM_KEYUP
-                },
-                LPARAM((down.0 & 0x21ff0000) | 0xc0000001),
-            );
+        if let Some(bridge) = bridge.as_ref() {
+            for press in &bridge.press {
+                if let Some(SpacePress::Host(msg, key, down)) = press.get() {
+                    press.set(Some(SpacePress::Released));
+                    self.post_host_space(
+                        bridge,
+                        Self::host_keyup(msg),
+                        key,
+                        Self::host_release(down),
+                    );
+                }
+            }
         }
     }
 

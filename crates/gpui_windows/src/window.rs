@@ -123,17 +123,19 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) host_space: RefCell<Option<HostSpace>>,
 }
 
-/// Space only; ownership survives changes to canvas text/control focus.
+/// Fixed native-key ownership survives changes to canvas text/control focus.
 pub(crate) struct HostSpace {
     pub(crate) shell: HWND,
     pub(crate) target: HWND,
     pub(crate) requested: Rc<Cell<bool>>,
-    pub(crate) press: Cell<Option<SpacePress>>,
+    pub(crate) press: [Cell<Option<SpacePress>>; HOST_SPACE_KEYS.len()],
+    pub(crate) chars: Cell<Option<(u32, isize)>>,
 }
+pub(crate) const HOST_SPACE_KEYS: &[u8] = b" ASDFGHJKWETYUZXCV";
 #[derive(Clone, Copy)]
 pub(crate) enum SpacePress {
     Local,
-    Host(u32, LPARAM),
+    Host(u32, WPARAM, LPARAM),
     Released,
 }
 

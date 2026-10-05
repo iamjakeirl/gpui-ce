@@ -137,9 +137,9 @@ impl WindowsPlatform {
         Self::new_with_mode(false, true)
     }
 
-    /// Enables Space routing for one embedded child of the supplied shell window.
+    /// Enables canvas-approved key routing for one embedded child of the supplied shell window.
     /// The shell's immediate parent is the editor parent supplied by the host. The
-    /// returned flag is set only by the canvas's non-text Space capture listener.
+    /// returned flag is set only by the canvas's non-text key capture listener.
     pub fn enable_host_space(
         &self,
         window: AnyWindowHandle,
@@ -167,7 +167,8 @@ impl WindowsPlatform {
             shell,
             target,
             requested: requested.clone(),
-            press: Cell::new(None),
+            press: std::array::from_fn(|_| Cell::new(None)),
+            chars: Cell::new(None),
         };
         anyhow::ensure!(
             inner.valid_host_space(&bridge),
